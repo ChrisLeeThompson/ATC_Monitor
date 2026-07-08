@@ -1,0 +1,19 @@
+# ATC Monitor - Python Dependencies
+# Python 3.11+ required
+#
+# NOTE: Thermo Scientific AutoScript 4.13+ is also required but is a
+# proprietary TFS package not available via pip.
+ 
+# GUI framework
+PySide6
+ 
+# Image processing & computer vision
+Pillow
+opencv-python
+scikit-image
+ 
+# Numerical computing
+numpy
+ 
+# Plotting
+matplotlib
