@@ -22,9 +22,13 @@ ENV/
 .coverage
 htmlcov/
 
-# ---- App runtime data ----
+# ---- Application runtime data ----
+# Logs, learned detector response, and run output are all generated at
+# runtime and are specific to one machine and one session.
 logs/
 *.log
+cb_plant.json*
+Saved_Data/
 
 # ---- IDE / OS ----
 .vscode/

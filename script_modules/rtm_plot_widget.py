@@ -1,5 +1,5 @@
 """
-Real-time monitor (RTM) plot widget.
+Real-Time Monitor (RTM) plot widget.
 """
 import matplotlib
 matplotlib.set_loglevel("WARNING")  # Suppress matplotlib debug messages
@@ -646,7 +646,7 @@ class RTMPlotWidget(BasePlotWidget):
         
         if dimensions_changed:
             logger.info(
-                f"Image dimensions changed: {self.image_width}x{self.image_height} → "
+                f"Image dimensions changed: {self.image_width}x{self.image_height} -> "
                 f"{width}x{height} (display: {display_w}x{display_h}, scale: {scale}x)"
             )
             self.image_width = width
@@ -864,7 +864,9 @@ class RTMPlotWidget(BasePlotWidget):
         orig_w = int(width / s)
         orig_h = int(height / s)
         
-        logger.info(f"Crop changed: ({orig_x}, {orig_y}) {orig_w}x{orig_h}")
+        # DEBUG: display-space duplicate of the authoritative "crop updated"
+        # record logged by MainWindow in model space.
+        logger.debug(f"Crop changed: ({orig_x}, {orig_y}) {orig_w}x{orig_h}")
         
         # Store as relative fractions (scale-independent)
         if self.image_width > 0 and self.image_height > 0:
@@ -918,13 +920,19 @@ class RTMPlotWidget(BasePlotWidget):
         :param direction: AutoScript scan-direction string (e.g. "BottomToTop"), or ""
         :param rotation_rad: pattern rotation in radians, clockwise-positive (default 0.0)
         """
+        # Re-invoked on every scan_direction_ready worker signal; log only on
+        # an actual change so the file keeps change forensics without a
+        # once-per-RTM-cycle duplicate.
+        changed = ((direction or "") != self._scan_direction
+                   or (rotation_rad or 0.0) != self._scan_rotation)
         self._scan_direction = direction or ""
         self._scan_rotation = rotation_rad or 0.0
         edges = _scan_direction_to_edges(self._scan_direction, self._scan_rotation)
-        logger.info(
-            f"Scan direction set to '{self._scan_direction}' "
-            f"(rotation {self._scan_rotation:.3f} rad) -> emphasize edges: {edges or 'none'}"
-        )
+        if changed:
+            logger.info(
+                f"Scan direction set to '{self._scan_direction}' "
+                f"(rotation {self._scan_rotation:.3f} rad) -> emphasize edges: {edges or 'none'}"
+            )
         if self.interactive_crop:
             self.interactive_crop.set_emphasis_edges(edges)
 

@@ -240,39 +240,76 @@ class TophatRadius(StyledDoubleSpinBox):
         self.setValue(initial_value)
 
 
-class EnergyDropFraction(StyledDoubleSpinBox):
+class StallWindow(StyledDoubleSpinBox):
+    """Stall latch: flat-window length in monitoring rounds (integer)."""
 
     def __init__(self, parent=None, constraints: SpinBoxConstraints | None = None,
-                 initial_value: float = 0.25):
+                 initial_value: int = 16):
+        super().__init__(parent)
+        # Integer parameter: constraints define no decimals field, so 0 is fixed here.
+        self.setDecimals(0)
+        if constraints:
+            self.setMinimum(constraints.stall_window_min)
+            self.setMaximum(constraints.stall_window_max)
+            self.setSingleStep(constraints.stall_window_single_step)
+        else:
+            self.setMinimum(4)
+            self.setMaximum(100)
+            self.setSingleStep(1)
+        self.setValue(initial_value)
+
+
+class StallDropFraction(StyledDoubleSpinBox):
+
+    def __init__(self, parent=None, constraints: SpinBoxConstraints | None = None,
+                 initial_value: float = 0.35):
         super().__init__(parent)
         if constraints:
-            self.setMinimum(constraints.energy_drop_fraction_min)
-            self.setMaximum(constraints.energy_drop_fraction_max)
-            self.setDecimals(constraints.energy_drop_fraction_decimals)
-            self.setSingleStep(constraints.energy_drop_fraction_single_step)
+            self.setMinimum(constraints.stall_drop_fraction_min)
+            self.setMaximum(constraints.stall_drop_fraction_max)
+            self.setDecimals(constraints.stall_drop_fraction_decimals)
+            self.setSingleStep(constraints.stall_drop_fraction_single_step)
         else:
-            self.setMinimum(0.01)
+            self.setMinimum(0.05)
             self.setMaximum(1.0)
             self.setDecimals(2)
             self.setSingleStep(0.05)
         self.setValue(initial_value)
 
 
-class EnergySlopeThreshold(StyledDoubleSpinBox):
+class StallRelTolerance(StyledDoubleSpinBox):
 
     def __init__(self, parent=None, constraints: SpinBoxConstraints | None = None,
-                 initial_value: float = 0.1):
+                 initial_value: float = 0.10):
         super().__init__(parent)
         if constraints:
-            self.setMinimum(constraints.energy_slope_threshold_min)
-            self.setMaximum(constraints.energy_slope_threshold_max)
-            self.setDecimals(constraints.energy_slope_threshold_decimals)
-            self.setSingleStep(constraints.energy_slope_threshold_single_step)
+            self.setMinimum(constraints.stall_rel_tolerance_min)
+            self.setMaximum(constraints.stall_rel_tolerance_max)
+            self.setDecimals(constraints.stall_rel_tolerance_decimals)
+            self.setSingleStep(constraints.stall_rel_tolerance_single_step)
+        else:
+            self.setMinimum(0.0)
+            self.setMaximum(1.0)
+            self.setDecimals(2)
+            self.setSingleStep(0.01)
+        self.setValue(initial_value)
+
+
+class StallAbsTolerance(StyledDoubleSpinBox):
+
+    def __init__(self, parent=None, constraints: SpinBoxConstraints | None = None,
+                 initial_value: float = 0.15):
+        super().__init__(parent)
+        if constraints:
+            self.setMinimum(constraints.stall_abs_tolerance_min)
+            self.setMaximum(constraints.stall_abs_tolerance_max)
+            self.setDecimals(constraints.stall_abs_tolerance_decimals)
+            self.setSingleStep(constraints.stall_abs_tolerance_single_step)
         else:
             self.setMinimum(0.0)
             self.setMaximum(10.0)
-            self.setDecimals(3)
-            self.setSingleStep(0.01)
+            self.setDecimals(2)
+            self.setSingleStep(0.05)
         self.setValue(initial_value)
 
 

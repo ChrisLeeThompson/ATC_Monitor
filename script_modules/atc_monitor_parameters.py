@@ -36,8 +36,8 @@ class BinarizationMethod(Enum):
     white. TOPHAT_ENERGY is a different approach: a morphological white top-hat that is
     agnostic to the absolute background level (see image_processing.white_tophat_map).
     """
-    TOP = auto()         # Brightest class only (thresholds[-1]) - original behavior
-    FROZEN_MID = auto()  # Middle boundary (4-class thresholds[1]) - balanced (default)
+    TOP = auto()         # Brightest Class only (thresholds[-1]) - original behavior
+    FROZEN_MID = auto()  # Middle Boundary (4-class thresholds[1]) - balanced (default)
     FROZEN_LOW = auto()  # Lowest boundary (4-class thresholds[0]) - most inclusive
     TOPHAT_ENERGY = auto()  # White top-hat continuous foreground energy (background-level agnostic)
 
@@ -48,14 +48,28 @@ class ForegroundCompletionMode(Enum):
 
     ABSOLUTE: the original behavior - foreground metric <= Maximum Pixels threshold.
 
-    RELATIVE_PLATEAU: grid-bar-immune. Done only when the foreground energy has both
-    (a) fallen to <= energy_drop_fraction of its start-of-monitoring value AND
-    (b) plateaued (slope of the energy history ~ 0). A constant static feature (e.g. a
-    grid bar) cancels out of the slope (a derivative ignores constants) and out of the
-    relative drop, so no absolute threshold has to be raised to "see over" it.
+    ABSOLUTE_PLUS_STALL (default): ABSOLUTE, plus a grid-bar backstop. The
+    criterion also passes when the foreground trace has (a) dropped to <=
+    stall_drop_fraction of its running peak AND (b) stayed flat for
+    stall_window consecutive rounds (windowed span on a median-smoothed series
+    within max(stall_rel_tolerance * value, stall_abs_tolerance)). Exposed
+    static material (e.g. a grid bar) floors the trace at a sample-dependent
+    non-zero level that no absolute threshold can be tuned to sit above in
+    advance (the 2026-08-17 hard failures, Runs 11/12); the latch completes
+    such runs once the trace has provably floored, while the ANDed match
+    criterion attests no structural change is still occurring. Validated
+    offline against the full 2026-08-17 campaign: identical completion batch
+    to plain ABSOLUTE on all 26 completed channels, and fires on the two hung
+    runs within 3 cycles of the operator's manual stop.
+
+    (RELATIVE_PLATEAU, 3.3.3's unused draft of this idea, was removed in
+    3.3.4: field replay showed it latching an innocent mid-run stall -- Run 17
+    P1 at batch 30 of 76 -- and never firing on floors above its
+    start-relative target. Persisted settings naming it fall back to the
+    default via _enum_from_name.)
     """
     ABSOLUTE = auto()
-    RELATIVE_PLATEAU = auto()
+    ABSOLUTE_PLUS_STALL = auto()
 
 
 class SupportedPatternType(Enum):
@@ -122,10 +136,12 @@ class ProcessingParameters:
     slope_method: SlopeMethod = SlopeMethod.GRADIENT                # Method for calculating mean pixel value slope
     binarization_method: BinarizationMethod = BinarizationMethod.FROZEN_MID  # How the foreground is isolated for the percent-pixels metric (incl. TOPHAT_ENERGY)
     tophat_radius: int = 5                                          # White top-hat disk radius (px) = max foreground feature scale; only used when binarization_method=TOPHAT_ENERGY
-    match_on_foreground: bool = False                              # Compute the match score on the normalized top-hat foreground map instead of the grayscale image (independent of binarization_method)
-    foreground_completion_mode: ForegroundCompletionMode = ForegroundCompletionMode.ABSOLUTE  # How the foreground criterion decides "done" (ABSOLUTE threshold vs grid-bar-immune RELATIVE_PLATEAU)
-    energy_drop_fraction: float = 0.25                             # RELATIVE_PLATEAU: foreground energy must fall to <= this fraction of its start-of-monitoring value
-    energy_slope_threshold: float = 0.1                            # RELATIVE_PLATEAU: |slope| of the foreground energy history considered "plateaued" (tool-tunable; scale tracks the energy scale)
+    match_on_foreground: bool = True                               # Compute the match score on the normalized top-hat foreground map instead of the grayscale change map (independent of binarization_method). Default True: the only field-validated matching path (2026-08-17 campaign)
+    foreground_completion_mode: ForegroundCompletionMode = ForegroundCompletionMode.ABSOLUTE_PLUS_STALL  # How the foreground criterion decides "done" (plain ABSOLUTE threshold, or ABSOLUTE plus the grid-bar stall latch)
+    stall_window: int = 16                                         # Stall latch: consecutive monitoring rounds the smoothed foreground trace must stay flat (~95 s at the 5 s default cadence)
+    stall_drop_fraction: float = 0.35                              # Stall latch: smoothed trace must be <= this fraction of its running peak before the latch can arm
+    stall_rel_tolerance: float = 0.10                              # Stall latch: relative flatness tolerance (fraction of the current smoothed value)
+    stall_abs_tolerance: float = 0.15                              # Stall latch: absolute flatness tolerance (foreground units); the larger of the two tolerances governs
     aspect_ratio_threshold: float = 0.3                             # Minimum aspect ratio for valid patterns (filters stress relief cuts)
     # Pattern matching parameters
     min_pattern_splits: int = 3                                     # Minimum number of splits per dimension for pattern matching
@@ -135,13 +151,13 @@ class ProcessingParameters:
     cb_white_level: float = 255.0                                   # FALLBACK full-scale; calibration auto-detects from imaging bit depth (2^bits-1) when readable
     cb_target_median_fraction: float = 0.45                         # Desired median brightness as a fraction of full-scale
     cb_target_contrast_span: float = 0.55                           # Desired robust occupied span (p2-p98) as a fraction of full-scale; the contrast setpoint
-    cb_max_white_clip_fraction: float = 0.01                        # Max acceptable fraction of pixels clipped at the ceiling (white)
-    cb_max_black_clip_fraction: float = 0.01                        # Max acceptable fraction of pixels clipped at the floor (black)
+    cb_max_white_clip_fraction: float = 0.02                        # Max acceptable fraction of pixels clipped at the ceiling (white saturation destroys the top-hat texture signal)
+    cb_max_black_clip_fraction: float = 0.05                        # Max acceptable fraction of pixels clipped at the floor (black pixels are background the top-hat removes anyway)
     cb_min_bound: float = 0.0                                       # Lower clamp for normalized detector CB writes
     cb_max_bound: float = 1.0                                       # Upper clamp for normalized detector CB writes
-    cb_max_iterations: int = 12                                     # Measurement budget before locking best-so-far (probe+jump+secant; loop exits early on convergence)
-    cb_settle_seconds: float = 0.5                                  # Settle after each CB write before re-grabbing RTM
-    cb_frames_per_measurement: int = 3                             # Frames averaged per measurement (decoupled from batch size)
+    cb_max_iterations: int = 12                                     # Measurement budget (verify included) before locking best-so-far; loop exits early on acceptance
+    cb_settle_seconds: float = 0.2                                  # Settle after each CB write before re-grabbing RTM (the RTM is no longer restarted per measurement)
+    cb_frames_per_measurement: int = 2                             # Frames pooled for ACCEPT/VERIFY measurements; search measurements always use 1 frame
 
 
 @dataclass
@@ -202,16 +218,25 @@ class SpinBoxConstraints:
     tophat_radius_max: int = 25
     tophat_radius_decimals: int = 0
     tophat_radius_single_step: int = 1
-    # Foreground RELATIVE_PLATEAU: energy must drop to <= this fraction of its start value
-    energy_drop_fraction_min: float = 0.01
-    energy_drop_fraction_max: float = 1.0
-    energy_drop_fraction_decimals: int = 2
-    energy_drop_fraction_single_step: float = 0.05
-    # Foreground RELATIVE_PLATEAU: |slope| of the energy history considered plateaued
-    energy_slope_threshold_min: float = 0.0
-    energy_slope_threshold_max: float = 10.0
-    energy_slope_threshold_decimals: int = 3
-    energy_slope_threshold_single_step: float = 0.01
+    # Foreground stall latch: flat-window length in monitoring rounds
+    stall_window_min: int = 4
+    stall_window_max: int = 100
+    stall_window_single_step: int = 1
+    # Foreground stall latch: drop-from-running-peak fraction required to arm
+    stall_drop_fraction_min: float = 0.05
+    stall_drop_fraction_max: float = 1.0
+    stall_drop_fraction_decimals: int = 2
+    stall_drop_fraction_single_step: float = 0.05
+    # Foreground stall latch: relative flatness tolerance (fraction of value)
+    stall_rel_tolerance_min: float = 0.0
+    stall_rel_tolerance_max: float = 1.0
+    stall_rel_tolerance_decimals: int = 2
+    stall_rel_tolerance_single_step: float = 0.01
+    # Foreground stall latch: absolute flatness tolerance (foreground units)
+    stall_abs_tolerance_min: float = 0.0
+    stall_abs_tolerance_max: float = 10.0
+    stall_abs_tolerance_decimals: int = 2
+    stall_abs_tolerance_single_step: float = 0.05
     # Number of points for slope calculation (gradient method)
     num_points_for_slope_min: int = 2
     num_points_for_slope_max: int = 10
@@ -381,8 +406,15 @@ class RTMParameters:
         settings.setValue("slope_method", self.processing.slope_method.name)
         settings.setValue("binarization_method", self.processing.binarization_method.name)
         settings.setValue("foreground_completion_mode", self.processing.foreground_completion_mode.name)
-        settings.setValue("energy_drop_fraction", self.processing.energy_drop_fraction)
-        settings.setValue("energy_slope_threshold", self.processing.energy_slope_threshold)
+        settings.setValue("stall_window", self.processing.stall_window)
+        settings.setValue("stall_drop_fraction", self.processing.stall_drop_fraction)
+        settings.setValue("stall_rel_tolerance", self.processing.stall_rel_tolerance)
+        settings.setValue("stall_abs_tolerance", self.processing.stall_abs_tolerance)
+        # Marks the 3.3.4 foreground-completion migration as applied (see
+        # load_settings). The old energy_drop_fraction / energy_slope_threshold
+        # keys are intentionally never reused: a persisted 0.25 would silently
+        # shadow the stall defaults.
+        settings.setValue("fg_schema_version", 2)
         settings.setValue("aspect_ratio_threshold", self.processing.aspect_ratio_threshold)
         settings.setValue("min_pattern_splits", self.processing.min_pattern_splits)
         settings.setValue("target_tile_size", self.processing.target_tile_size)
@@ -398,6 +430,8 @@ class RTMParameters:
         settings.setValue("cb_max_iterations", self.processing.cb_max_iterations)
         settings.setValue("cb_settle_seconds", self.processing.cb_settle_seconds)
         settings.setValue("cb_frames_per_measurement", self.processing.cb_frames_per_measurement)
+        # Marks the 3.3.1 CB-retune migration as applied (see load_settings).
+        settings.setValue("cb_schema_version", 2)
         settings.endGroup()
 
         logger.info("Settings saved")
@@ -499,15 +533,48 @@ class RTMParameters:
         self.processing.binarization_method = _enum_from_name(
             BinarizationMethod, binarization_name, defaults_proc.binarization_method)
 
-        foreground_mode_name = settings.value(
-            "foreground_completion_mode", defaults_proc.foreground_completion_mode.name)
-        self.processing.foreground_completion_mode = _enum_from_name(
-            ForegroundCompletionMode, foreground_mode_name,
-            defaults_proc.foreground_completion_mode)
-        self.processing.energy_drop_fraction = float(
-            settings.value("energy_drop_fraction", defaults_proc.energy_drop_fraction))
-        self.processing.energy_slope_threshold = float(
-            settings.value("energy_slope_threshold", defaults_proc.energy_slope_threshold))
+        # One-time migration (fg schema v2, ATC Monitor 3.3.4): the stall latch
+        # replaced RELATIVE_PLATEAU and became part of the default mode. Every
+        # install that ran 3.3.x has "ABSOLUTE" persisted (the old default),
+        # and stored values win over dataclass defaults -- so without this the
+        # grid-bar backstop would silently never deploy on existing tools. A
+        # mode the user changes after the migration is respected like any
+        # other setting. (A persisted "RELATIVE_PLATEAU" no longer names an
+        # enum member and falls back to the default via _enum_from_name.)
+        fg_migrated = int(settings.value("fg_schema_version", 1)) < 2
+        if fg_migrated:
+            logger.info(
+                "Foreground completion schema upgrade: enabling the "
+                "ABSOLUTE_PLUS_STALL default (grid-bar stall latch) and the "
+                "field-validated foreground matching path"
+            )
+            self.processing.foreground_completion_mode = (
+                defaults_proc.foreground_completion_mode)
+            # match_on_foreground has been persisted since 3.3.0 with the old
+            # False default, and stored values win over dataclass defaults --
+            # without this one-time force, the v3.3.4 default flip to the only
+            # field-validated matching path would silently never deploy on any
+            # tool upgraded in place (the same trap this migration exists for).
+            # This assignment intentionally OVERRIDES the unconditional read
+            # earlier in load_settings; a value the user changes after the
+            # migration is respected like any other setting.
+            self.processing.match_on_foreground = (
+                defaults_proc.match_on_foreground)
+        else:
+            foreground_mode_name = settings.value(
+                "foreground_completion_mode",
+                defaults_proc.foreground_completion_mode.name)
+            self.processing.foreground_completion_mode = _enum_from_name(
+                ForegroundCompletionMode, foreground_mode_name,
+                defaults_proc.foreground_completion_mode)
+        self.processing.stall_window = int(
+            settings.value("stall_window", defaults_proc.stall_window))
+        self.processing.stall_drop_fraction = float(
+            settings.value("stall_drop_fraction", defaults_proc.stall_drop_fraction))
+        self.processing.stall_rel_tolerance = float(
+            settings.value("stall_rel_tolerance", defaults_proc.stall_rel_tolerance))
+        self.processing.stall_abs_tolerance = float(
+            settings.value("stall_abs_tolerance", defaults_proc.stall_abs_tolerance))
 
         self.processing.aspect_ratio_threshold = float(
             settings.value("aspect_ratio_threshold", defaults_proc.aspect_ratio_threshold))
@@ -525,20 +592,39 @@ class RTMParameters:
             settings.value("cb_target_median_fraction", defaults_proc.cb_target_median_fraction))
         self.processing.cb_target_contrast_span = float(
             settings.value("cb_target_contrast_span", defaults_proc.cb_target_contrast_span))
-        self.processing.cb_max_white_clip_fraction = float(
-            settings.value("cb_max_white_clip_fraction", defaults_proc.cb_max_white_clip_fraction))
-        self.processing.cb_max_black_clip_fraction = float(
-            settings.value("cb_max_black_clip_fraction", defaults_proc.cb_max_black_clip_fraction))
+        # One-time migration (schema v2, ATC Monitor 3.3.1): the acceptance/
+        # latency retune changed these four defaults (clip 0.01/0.01 ->
+        # 0.02/0.05, settle 0.5 -> 0.2, verify frames 3 -> 2). Every install
+        # that ran 3.3.0 has the OLD values persisted, and stored values win
+        # over dataclass defaults -- so without this the retune would silently
+        # never deploy on the very tools it was built for. The version key is
+        # bumped once (in save_settings); values the user changes after the
+        # migration are respected like any other setting.
+        cb_migrated = int(settings.value("cb_schema_version", 1)) < 2
+        if cb_migrated:
+            logger.info(
+                "Auto CB settings schema upgrade: applying the 3.3.1 retuned "
+                "defaults for clip limits, settle time, and verify frames"
+            )
+            self.processing.cb_max_white_clip_fraction = defaults_proc.cb_max_white_clip_fraction
+            self.processing.cb_max_black_clip_fraction = defaults_proc.cb_max_black_clip_fraction
+            self.processing.cb_settle_seconds = defaults_proc.cb_settle_seconds
+            self.processing.cb_frames_per_measurement = defaults_proc.cb_frames_per_measurement
+        else:
+            self.processing.cb_max_white_clip_fraction = float(
+                settings.value("cb_max_white_clip_fraction", defaults_proc.cb_max_white_clip_fraction))
+            self.processing.cb_max_black_clip_fraction = float(
+                settings.value("cb_max_black_clip_fraction", defaults_proc.cb_max_black_clip_fraction))
+            self.processing.cb_settle_seconds = float(
+                settings.value("cb_settle_seconds", defaults_proc.cb_settle_seconds))
+            self.processing.cb_frames_per_measurement = int(
+                settings.value("cb_frames_per_measurement", defaults_proc.cb_frames_per_measurement))
         self.processing.cb_min_bound = float(
             settings.value("cb_min_bound", defaults_proc.cb_min_bound))
         self.processing.cb_max_bound = float(
             settings.value("cb_max_bound", defaults_proc.cb_max_bound))
         self.processing.cb_max_iterations = int(
             settings.value("cb_max_iterations", defaults_proc.cb_max_iterations))
-        self.processing.cb_settle_seconds = float(
-            settings.value("cb_settle_seconds", defaults_proc.cb_settle_seconds))
-        self.processing.cb_frames_per_measurement = int(
-            settings.value("cb_frames_per_measurement", defaults_proc.cb_frames_per_measurement))
 
         settings.endGroup()
         

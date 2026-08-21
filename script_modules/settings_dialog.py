@@ -25,7 +25,8 @@ from script_modules.spinbox_widgets import (
     AcquisitionDelay, PercentDifferenceThreshold, GaussianSigma,
     ThresholdNumberOfClasses, TophatRadius, NumberOfPointsForGradientSlope,
     LinearRegressionFitPoints, AspectRatioThreshold, MinimumNumberOfImageRegionSplits,
-    TargetImageRegionTileSize, EnergyDropFraction, EnergySlopeThreshold,
+    TargetImageRegionTileSize, StallWindow, StallDropFraction,
+    StallRelTolerance, StallAbsTolerance,
     CBWhiteLevel, CBTargetMedianFraction, CBTargetContrastSpan,
     CBMaxWhiteClipFraction, CBMaxBlackClipFraction, CBMinBound, CBMaxBound,
     CBMaxIterations, CBSettleSeconds, CBFramesPerMeasurement
@@ -98,9 +99,9 @@ class SettingsDialog(QDialog):
         # Foreground isolation method (feeds the percent-pixels completion metric)
         self.binarization_method_combobox = self._create_enum_combobox(
             BinarizationMethod, {
-                BinarizationMethod.TOP: "Brightest class",
-                BinarizationMethod.FROZEN_MID: "Middle boundary",
-                BinarizationMethod.FROZEN_LOW: "Low boundary",
+                BinarizationMethod.TOP: "Brightest Class",
+                BinarizationMethod.FROZEN_MID: "Middle Boundary",
+                BinarizationMethod.FROZEN_LOW: "Low Boundary",
                 BinarizationMethod.TOPHAT_ENERGY: "Top-Hat Foreground Energy",
             }
         )
@@ -118,27 +119,37 @@ class SettingsDialog(QDialog):
         self.match_on_foreground_checkbox = QCheckBox()
         self.match_on_foreground_checkbox.setStyleSheet(AppStyles.CheckBox.settings_dialog())
         self.match_on_foreground_checkbox.setChecked(self._initial.match_on_foreground)
-        # Foreground completion mode (absolute level vs grid-bar-immune relative+plateau)
+        # Foreground completion mode (plain absolute threshold vs absolute + grid-bar stall latch)
         self.foreground_completion_mode_combobox = self._create_enum_combobox(
             ForegroundCompletionMode, {
                 ForegroundCompletionMode.ABSOLUTE: "Absolute (threshold)",
-                ForegroundCompletionMode.RELATIVE_PLATEAU: "Relative drop + plateau",
+                ForegroundCompletionMode.ABSOLUTE_PLUS_STALL: "Absolute + stall latch",
             }
         )
         self.foreground_completion_mode_combobox.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.foreground_completion_mode_combobox.setCurrentIndex(
             self.foreground_completion_mode_combobox.findData(self._initial.foreground_completion_mode)
         )
-        # RELATIVE_PLATEAU thresholds (only used when mode = Relative drop + plateau)
-        self.energy_drop_fraction_spinbox = EnergyDropFraction(
+        # Stall latch settings (only used when mode = Absolute + stall latch)
+        self.stall_window_spinbox = StallWindow(
             parent=self,
             constraints=self._constraints,
-            initial_value=self._initial.energy_drop_fraction
+            initial_value=self._initial.stall_window
         )
-        self.energy_slope_threshold_spinbox = EnergySlopeThreshold(
+        self.stall_drop_fraction_spinbox = StallDropFraction(
             parent=self,
             constraints=self._constraints,
-            initial_value=self._initial.energy_slope_threshold
+            initial_value=self._initial.stall_drop_fraction
+        )
+        self.stall_rel_tolerance_spinbox = StallRelTolerance(
+            parent=self,
+            constraints=self._constraints,
+            initial_value=self._initial.stall_rel_tolerance
+        )
+        self.stall_abs_tolerance_spinbox = StallAbsTolerance(
+            parent=self,
+            constraints=self._constraints,
+            initial_value=self._initial.stall_abs_tolerance
         )
         ## Image analysis group
         # Method combo box
@@ -274,10 +285,12 @@ class SettingsDialog(QDialog):
         self._add_row_to_grid_layout(image_processing_grid_layout, 2, "Multi-Otsu Threshold Classes", self.threshold_number_of_classes_spinbox, tooltip=AppStyles.AppToolTips.THRESHOLD_NUM_CLASSES_LABEL)
         self._add_row_to_grid_layout(image_processing_grid_layout, 3, "Binarization Method", self.binarization_method_combobox, tooltip=AppStyles.AppToolTips.BINARIZATION_METHOD_LABEL)
         self._add_row_to_grid_layout(image_processing_grid_layout, 4, "Top-Hat Radius (px)", self.tophat_radius_spinbox, tooltip=AppStyles.AppToolTips.TOPHAT_RADIUS_LABEL)
-        self._add_row_to_grid_layout(image_processing_grid_layout, 5, "Match On Foreground Map", self.match_on_foreground_checkbox, tooltip=AppStyles.AppToolTips.MATCH_ON_FOREGROUND_LABEL)
+        self._add_row_to_grid_layout(image_processing_grid_layout, 5, "Match on Foreground Map", self.match_on_foreground_checkbox, tooltip=AppStyles.AppToolTips.MATCH_ON_FOREGROUND_LABEL)
         self._add_row_to_grid_layout(image_processing_grid_layout, 6, "Foreground Completion Mode", self.foreground_completion_mode_combobox, tooltip=AppStyles.AppToolTips.FOREGROUND_COMPLETION_MODE_LABEL)
-        self._add_row_to_grid_layout(image_processing_grid_layout, 7, "Energy Drop Fraction", self.energy_drop_fraction_spinbox, tooltip=AppStyles.AppToolTips.ENERGY_DROP_FRACTION_LABEL)
-        self._add_row_to_grid_layout(image_processing_grid_layout, 8, "Energy Slope Threshold", self.energy_slope_threshold_spinbox, tooltip=AppStyles.AppToolTips.ENERGY_SLOPE_THRESHOLD_LABEL)
+        self._add_row_to_grid_layout(image_processing_grid_layout, 7, "Stall Window (rounds)", self.stall_window_spinbox, tooltip=AppStyles.AppToolTips.STALL_WINDOW_LABEL)
+        self._add_row_to_grid_layout(image_processing_grid_layout, 8, "Stall Drop Fraction", self.stall_drop_fraction_spinbox, tooltip=AppStyles.AppToolTips.STALL_DROP_FRACTION_LABEL)
+        self._add_row_to_grid_layout(image_processing_grid_layout, 9, "Stall Relative Tolerance", self.stall_rel_tolerance_spinbox, tooltip=AppStyles.AppToolTips.STALL_REL_TOLERANCE_LABEL)
+        self._add_row_to_grid_layout(image_processing_grid_layout, 10, "Stall Absolute Tolerance", self.stall_abs_tolerance_spinbox, tooltip=AppStyles.AppToolTips.STALL_ABS_TOLERANCE_LABEL)
         image_processing_group_box.setLayout(image_processing_grid_layout)
         # Image analysis group layout
         image_analysis_group_box = QGroupBox("Image Analysis")
@@ -294,7 +307,7 @@ class SettingsDialog(QDialog):
         pattern_matching_group_box.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         pattern_matching_group_box.setStyleSheet(AppStyles.GroupBox.settings())
         pattern_matching_grid_layout = QGridLayout()
-        self._add_row_to_grid_layout(pattern_matching_grid_layout, 0, "Minimum Number Of RTM Sub-Regions", self.minimum_number_of_image_region_splits_spinbox, tooltip=AppStyles.AppToolTips.MIN_PATTERN_SPLITS_LABEL)
+        self._add_row_to_grid_layout(pattern_matching_grid_layout, 0, "Minimum Number of RTM Sub-Regions", self.minimum_number_of_image_region_splits_spinbox, tooltip=AppStyles.AppToolTips.MIN_PATTERN_SPLITS_LABEL)
         self._add_row_to_grid_layout(pattern_matching_grid_layout, 1, "Target Region Tile Size (px)", self.target_image_region_tile_size_spinbox, tooltip=AppStyles.AppToolTips.TARGET_TILE_SIZE_LABEL)
         pattern_matching_group_box.setLayout(pattern_matching_grid_layout)
         # Contrast/Brightness calibration group layout
@@ -302,17 +315,17 @@ class SettingsDialog(QDialog):
         cb_group_box.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         cb_group_box.setStyleSheet(AppStyles.GroupBox.settings())
         cb_grid_layout = QGridLayout()
-        self._add_row_to_grid_layout(cb_grid_layout, 0, "Auto-Calibrate On Start", self.auto_cb_on_start_checkbox, tooltip=AppStyles.AppToolTips.CB_AUTO_ON_START_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 0, "Auto-Calibrate on Start", self.auto_cb_on_start_checkbox, tooltip=AppStyles.AppToolTips.CB_AUTO_ON_START_LABEL)
         self._add_row_to_grid_layout(cb_grid_layout, 1, "Detector White Level (fallback)", self.cb_white_level_spinbox, tooltip=AppStyles.AppToolTips.CB_WHITE_LEVEL_LABEL)
         self._add_row_to_grid_layout(cb_grid_layout, 2, "Target Median (fraction)", self.cb_target_median_fraction_spinbox, tooltip=AppStyles.AppToolTips.CB_TARGET_MEDIAN_FRACTION_LABEL)
         self._add_row_to_grid_layout(cb_grid_layout, 3, "Target Contrast Span (fraction)", self.cb_target_contrast_span_spinbox, tooltip=AppStyles.AppToolTips.CB_TARGET_CONTRAST_SPAN_LABEL)
         self._add_row_to_grid_layout(cb_grid_layout, 4, "Max White Clip (fraction)", self.cb_max_white_clip_fraction_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_WHITE_CLIP_FRACTION_LABEL)
         self._add_row_to_grid_layout(cb_grid_layout, 5, "Max Black Clip (fraction)", self.cb_max_black_clip_fraction_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_BLACK_CLIP_FRACTION_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 6, "CB Lower Bound", self.cb_min_bound_spinbox, tooltip=AppStyles.AppToolTips.CB_MIN_BOUND_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 7, "CB Upper Bound", self.cb_max_bound_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_BOUND_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 6, "C/B Lower Bound", self.cb_min_bound_spinbox, tooltip=AppStyles.AppToolTips.CB_MIN_BOUND_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 7, "C/B Upper Bound", self.cb_max_bound_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_BOUND_LABEL)
         self._add_row_to_grid_layout(cb_grid_layout, 8, "Max Iterations", self.cb_max_iterations_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_ITERATIONS_LABEL)
         self._add_row_to_grid_layout(cb_grid_layout, 9, "Settle Time (s)", self.cb_settle_seconds_spinbox, tooltip=AppStyles.AppToolTips.CB_SETTLE_SECONDS_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 10, "Frames Per Measurement", self.cb_frames_per_measurement_spinbox, tooltip=AppStyles.AppToolTips.CB_FRAMES_PER_MEASUREMENT_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 10, "Verify Frames", self.cb_frames_per_measurement_spinbox, tooltip=AppStyles.AppToolTips.CB_FRAMES_PER_MEASUREMENT_LABEL)
         cb_group_box.setLayout(cb_grid_layout)
         # Buttons layout
         buttons_layout = QHBoxLayout()
@@ -409,7 +422,26 @@ class SettingsDialog(QDialog):
         self.save_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
         self.restore_defaults_button.clicked.connect(self._on_restore_defaults)
-    
+        # Stall settings apply only to the Absolute + stall latch mode
+        self.foreground_completion_mode_combobox.currentIndexChanged.connect(
+            self._update_stall_settings_enabled
+        )
+        self._update_stall_settings_enabled()
+
+    def _update_stall_settings_enabled(self):
+        """Enable the stall spinboxes only when the stall latch mode is selected."""
+        stall_mode = (
+            self._get_enum_value(self.foreground_completion_mode_combobox)
+            == ForegroundCompletionMode.ABSOLUTE_PLUS_STALL
+        )
+        for spinbox in (
+            self.stall_window_spinbox,
+            self.stall_drop_fraction_spinbox,
+            self.stall_rel_tolerance_spinbox,
+            self.stall_abs_tolerance_spinbox,
+        ):
+            spinbox.setEnabled(stall_mode)
+
     def _on_restore_defaults(self):
         # Reset all fields to defaults
         self.acquisition_delay_spinbox.setValue(self._defaults.acquisition_delay_seconds)
@@ -420,8 +452,13 @@ class SettingsDialog(QDialog):
         self.tophat_radius_spinbox.setValue(self._defaults.tophat_radius)
         self.match_on_foreground_checkbox.setChecked(self._defaults.match_on_foreground)
         self.foreground_completion_mode_combobox.setCurrentIndex(self.foreground_completion_mode_combobox.findData(self._defaults.foreground_completion_mode))
-        self.energy_drop_fraction_spinbox.setValue(self._defaults.energy_drop_fraction)
-        self.energy_slope_threshold_spinbox.setValue(self._defaults.energy_slope_threshold)
+        self.stall_window_spinbox.setValue(self._defaults.stall_window)
+        self.stall_drop_fraction_spinbox.setValue(self._defaults.stall_drop_fraction)
+        self.stall_rel_tolerance_spinbox.setValue(self._defaults.stall_rel_tolerance)
+        self.stall_abs_tolerance_spinbox.setValue(self._defaults.stall_abs_tolerance)
+        # setCurrentIndex only fires currentIndexChanged on an actual change,
+        # so refresh the stall-row enable state explicitly.
+        self._update_stall_settings_enabled()
         self.binarization_method_combobox.setCurrentIndex(self.binarization_method_combobox.findData(self._defaults.binarization_method))
         self.slope_method_combobox.setCurrentIndex(self.slope_method_combobox.findData(self._defaults.slope_method))
         self.number_of_points_for_gradient_slope_spinbox.setValue(self._defaults.num_points_for_slope)
@@ -456,8 +493,10 @@ class SettingsDialog(QDialog):
             tophat_radius=int(self.tophat_radius_spinbox.value()),
             match_on_foreground=self.match_on_foreground_checkbox.isChecked(),
             foreground_completion_mode=self._get_enum_value(self.foreground_completion_mode_combobox),
-            energy_drop_fraction=self.energy_drop_fraction_spinbox.value(),
-            energy_slope_threshold=self.energy_slope_threshold_spinbox.value(),
+            stall_window=int(self.stall_window_spinbox.value()),
+            stall_drop_fraction=self.stall_drop_fraction_spinbox.value(),
+            stall_rel_tolerance=self.stall_rel_tolerance_spinbox.value(),
+            stall_abs_tolerance=self.stall_abs_tolerance_spinbox.value(),
             binarization_method=self._get_enum_value(self.binarization_method_combobox),
             slope_method=self._get_enum_value(self.slope_method_combobox),
             num_points_for_slope=int(self.number_of_points_for_gradient_slope_spinbox.value()),

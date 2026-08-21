@@ -104,7 +104,7 @@ class MeanPixelPlotWidget(BasePlotWidget):
         self._style_axes(self.ax)
         
         # Restore title
-        self.ax.set_title("Mean Pixel Value", fontsize=AppStyles.Dimensions.PLOT_TITLE_FONT_SIZE)
+        self.ax.set_title("Mean Pixel Value / Specimen Current", fontsize=AppStyles.Dimensions.PLOT_TITLE_FONT_SIZE)
         
         self.canvas.draw_idle()
 

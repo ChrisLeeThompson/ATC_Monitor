@@ -1,19 +1,22 @@
-# ATC Monitor - Python Dependencies
-# Python 3.11+ required
-#
-# NOTE: Thermo Scientific AutoScript 4.13+ is also required but is a
-# proprietary TFS package not available via pip.
- 
-# GUI framework
-PySide6
- 
-# Image processing & computer vision
-Pillow
-opencv-python
-scikit-image
- 
-# Numerical computing
+# ATC Monitor - Python dependencies
+# Python 3.11. Thermo Scientific AutoScript 4.13+ is also required
+# (proprietary TFS package, not on pip; its Enthought environment already
+# bundles every package below).
+
+# GUI framework - pinned to the validated version. Qt object-lifetime behavior
+# is version-sensitive: the worker teardown path destroys QObjects explicitly
+# and was validated against this exact release.
+PySide6==6.7.1
+
+# Installed automatically as a PySide6 dependency, and imported directly by the
+# worker teardown path (shiboken6.isValid / shiboken6.delete).
+shiboken6==6.7.1
+
+# Imaging / analysis
 numpy
- 
+opencv-python
+Pillow
+scikit-image
+
 # Plotting
 matplotlib

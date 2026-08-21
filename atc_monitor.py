@@ -1,21 +1,21 @@
 """
 ATC Monitor
 .
-This UI is designed to monitor real-time monitor (RTM) data generated from a Thermo Scientific FIB-SEM microscope.
-Specifically, it processes RTM images while Thermo Scientific AutoTEM Cryo performs rough milling with one or two patterns (Rectangle or Regular Cross-section).
-For now, the script is designed for rectangle patterns (regular cross-section patterns may or may not work well, at the moment).
+This UI is designed to analyze real-time monitor (RTM) data generated from a Thermo Scientific FIB-SEM microscope.
+Specifically, it processes RTM images while Thermo Scientific AutoTEM Cryo performs rough milling with one or two rectangle patterns.
+The script supports rectangle patterns only (regular cross-section and cleaning cross-section patterns are rejected during validation).
 .
 The application runs in the background while FIB patterns are generating RTM data. Based on analysis of the images, the application
 will stop FIB patterning if certain criteria are met.
 .
 Thermo Scientific AutoScript 4.13+ is required, and the application uses only modules included with AutoScript (no extra dependencies).
+Script created with the assistance of Claude Code.
 .
 If you have any questions or suggestions for improvements, please contact me (Chris Thompson on GitHub: ChrisLeeThompson).
 .
 Thank you,
 Chris Thompson
 .
-March 13, 2026
 .
 .
 MIT License
@@ -33,20 +33,31 @@ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTH
 WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+import atexit
+import gc
 import logging
 import os
+import queue
 import sys
 import platform
+import threading
+import time
 import faulthandler
-from logging.handlers import RotatingFileHandler
+import weakref
+
+import shiboken6
+from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow, QApplication, QVBoxLayout, QWidget,
     QHBoxLayout, QSizePolicy, QLabel
 )
 from PySide6.QtGui import QFont, QIcon
-from PySide6.QtCore import Slot, Signal, QRect, QThread, Qt, qInstallMessageHandler, QtMsgType
-from script_modules.app_styles import AppStyles
+from PySide6.QtCore import Slot, Signal, QRect, QThread, QTimer, Qt, qInstallMessageHandler, QtMsgType
+from script_modules import app_paths
+from script_modules import crash_breadcrumbs
+from script_modules.gui_watchdog import GuiWatchdog
+from script_modules.app_styles import AppStyles, APP_VERSION
 from script_modules.monitoring_icon import CatbugMonitoringIcon
 from script_modules.pattern_one_group_box import PatternOneGroupBox
 from script_modules.pattern_two_group_box import PatternTwoGroupBox
@@ -54,7 +65,9 @@ from script_modules.controls_group_box import ControlsGroupBox
 from script_modules.pattern_results_group_box import PatternResultsGroupBox
 from script_modules.button_widgets import StartButton, StopButton, PauseResumeButton
 from script_modules.status_bar_widget import StatusBarWidget
-from script_modules.atc_monitor_parameters import load_parameters, RTMMode
+from script_modules.atc_monitor_parameters import (
+    load_parameters, RTMMode
+)
 from script_modules.workflow_worker import WorkflowWorker, WorkerParameters
 from script_modules.settings_dialog import SettingsDialog
 
@@ -66,6 +79,10 @@ logger = logging.getLogger(__name__)
 # raw file descriptor at crash time; a closed fd would mean the native-fault
 # traceback is silently lost -- the exact failure this is meant to capture.
 _FAULT_FP = None
+
+# The QueueListener that owns the log sink handlers, kept module-global so
+# tests can stop/flush it deterministically (mirrors the _FAULT_FP pattern).
+_LOG_LISTENER = None
 
 
 class MainWindow(QMainWindow):
@@ -131,6 +148,10 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.worker_thread = None
 
+        # GUI responsiveness watchdog (created/started in main(); None when
+        # the crash fd is unavailable).
+        self._gui_watchdog = None
+
         # Drives information_label_2 (catbug status message). Combined via
         # _update_monitoring_message() with precedence stopped > paused >
         # detecting > idle.
@@ -151,7 +172,7 @@ class MainWindow(QMainWindow):
             constraints=self.params.spin_box_constraints,
             initial_values=self.params.ui
         )
-        # Get threshold parameters for pattern one plot 
+        # Get threshold parameters for pattern one plot
         initial_threshold = self.params.ui.match_score_threshold
         threshold_min = self.params.spin_box_constraints.match_score_threshold_min
         threshold_max = self.params.spin_box_constraints.match_score_threshold_max
@@ -333,12 +354,19 @@ class MainWindow(QMainWindow):
         spinbox = self.controls_group_box.match_score_threshold_spinbox
         spinbox.blockSignals(True)
         spinbox.setValue(threshold)
+        # Read back the spinbox's QUANTIZED value and use it everywhere: the
+        # raw drag position carries more decimals than the spinbox displays or
+        # persists, and gating the worker at an invisible value means the same
+        # displayed configuration behaves differently after a restart.
+        threshold = spinbox.value()
         spinbox.blockSignals(False)
         # Update central parameters
         self.params.ui.match_score_threshold = threshold
-        # Update the other pattern's threshold line to match
+        # Snap BOTH plots' lines to the quantized value (the source line sits
+        # at the raw drag position otherwise; set_* does not re-emit).
         other_idx = 1 - source_idx
         self.pattern_group_boxes[other_idx].set_match_score_threshold(threshold)
+        self.pattern_group_boxes[source_idx].set_match_score_threshold(threshold)
         # Push to worker (spinbox signals blocked, so worker connection won't fire)
         if self.worker:
             self._update_both_patterns('match_score_threshold', threshold)
@@ -386,7 +414,7 @@ class MainWindow(QMainWindow):
         """
         is_energy = self.params.processing.binarization_method.name == "TOPHAT_ENERGY"
         self.controls_group_box.set_pixels_threshold_label(
-            "Max Foreground Energy" if is_energy else "Maximum Pixels Threshold"
+            "Maximum Foreground Energy" if is_energy else "Maximum Pixels Threshold"
         )
         self.pattern_results_group_box.set_pixels_criterion_label(
             "Foreground Energy" if is_energy else "Percent Pixels"
@@ -407,7 +435,8 @@ class MainWindow(QMainWindow):
             # metric labels honest (white-pixel % vs Top-Hat energy).
             self._refresh_metric_labels()
             logger.info("Advanced settings updated and saved")
-    
+            crash_breadcrumbs.drop("settings-saved")
+
     # ========================================
     # Button Click Handlers
     # ========================================
@@ -435,7 +464,7 @@ class MainWindow(QMainWindow):
         self.controls_group_box.set_monitoring_mode_enabled(False)
         self.controls_group_box.save_data_checkbox.setEnabled(False)
 
-        # Run begins -> catbug message shows "Monitoring..." (gray until first detection)
+        # Run begins -> catbug message shows "Monitoring (waiting for patterning)..." (gray until first detection)
         self._monitoring_running = True
         self._monitoring_paused = False
         self._monitoring_detecting = False
@@ -466,21 +495,128 @@ class MainWindow(QMainWindow):
         # Start the thread (its event loop will dispatch the queued run()).
         self.worker_thread.start()
 
+        crash_breadcrumbs.drop("start-clicked")
         logger.info("Start button clicked - worker thread started")
 
     def _reap_worker(self):
         """
-        Release references to a previously finished worker/thread so Python/Qt
-        can delete them. Only called when no run is active (the thread has
-        finished), so dropping the references is safe and prevents the prior
-        per-Start object leak.
+        Destroy a previously finished worker/thread deterministically.
+
+        The 2026-08-18 on-tool abort traced to GC-timed destruction: the old
+        worker/QThread wrappers survived the plain ref-drop via PySide's cached
+        SignalInstance self-cycle, so their Qt C++ destructors ran inside a
+        later cyclic-GC pass -- on the main thread, mid-signal-dispatch, on a
+        QObject whose affinity thread was dead. Qt object lifetime must never
+        depend on GC timing: disconnect everything and delete the C++ objects
+        explicitly, here, where no signal delivery is on the stack.
         """
+        if self.worker is None and self.worker_thread is None:
+            return
+
+        # Never destroy a running thread's objects. Dropping the refs after a
+        # timed-out wait would run ~QThread on a running thread -> qFatal ->
+        # abort on the main thread. Keep the refs instead; the on_start_clicked
+        # isRunning guard keeps blocking the next Start.
         if self.worker_thread is not None and self.worker_thread.isRunning():
-            # Defensive: should not happen (callers guard on isRunning()).
             self.worker_thread.quit()
-            self.worker_thread.wait(5000)
+            if not self.worker_thread.wait(5000):
+                logger.error(
+                    "Reap refused: worker thread still running after quit+5s "
+                    "wait; keeping references (no destruction of a live thread)"
+                )
+                return
+
+        if self.worker is not None:
+            # Drop the GUI->worker control connections BEFORE destroying: their
+            # sender (this window) outlives the worker, so without this they
+            # accumulate per Start and would deliver into a dead worker's
+            # slots. Worker-as-sender connections need no explicit disconnect;
+            # the shiboken6.delete below destroys them with the C++ object
+            # (PySide 6.7.1 has no blanket QObject.disconnect() anyway).
+            for sig, slot in (
+                (self.request_worker_stop, self.worker.request_stop),
+                (self.request_worker_pause, self.worker.request_pause),
+                (self.request_worker_resume, self.worker.request_resume),
+                (self.request_worker_param, self.worker.update_parameter),
+            ):
+                try:
+                    sig.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+
+            # Field probe (2026-08-18 crash follow-up): record whether the
+            # wrapper carries cached SignalInstance attrs and whether anything
+            # keeps the wrapper shells alive past this reap. One on-tool
+            # session's log settles whether GC-deferred destruction (the
+            # crash hypothesis) actually occurs there; not reproducible on
+            # the dev box.
+            sig_keys = [k for k, v in self.worker.__dict__.items()
+                        if type(v).__name__ == "SignalInstance"]
+            logger.info(f"Reap: cached SignalInstance attrs on worker: {sig_keys}")
+            wr = weakref.ref(self.worker)
+            wt = (weakref.ref(self.worker_thread)
+                  if self.worker_thread is not None else None)
+            QTimer.singleShot(0, lambda: logger.info(
+                "Post-reap wrappers alive: worker=%s, thread=%s" % (
+                    wr() is not None,
+                    "n/a" if wt is None else (wt() is not None),
+                )
+            ))
+
+            # Deterministic C++ destruction, now, on the main thread (the
+            # worker re-homed its affinity here at the end of run()).
+            # deleteLater is not used: it would leave a window in which a
+            # cyclic wrapper's GC dealloc deletes the C++ object anyway.
+            if shiboken6.isValid(self.worker):
+                shiboken6.delete(self.worker)
+        if self.worker_thread is not None and shiboken6.isValid(self.worker_thread):
+            shiboken6.delete(self.worker_thread)
+
         self.worker = None
         self.worker_thread = None
+        crash_breadcrumbs.drop("reaped")
+        # Sweep the now destructor-free wrapper shells (and any other cyclic
+        # garbage) at a known-idle main-loop point instead of inside an
+        # arbitrary allocation.
+        QTimer.singleShot(0, gc.collect)
+
+    def _check_worker_teardown(self, thread, attempt: int = 1):
+        """
+        Crash-diagnosis instrumentation (2026-08-14 heap-corruption follow-up):
+        the on-tool log showed the 'Post-connect: N live threads' count growing
+        2 -> 6 across Start/Stop cycles. That is EITHER worker threads genuinely
+        outliving Stop (a real leak, and a prime suspect for the 0xc0000374
+        heap corruption) OR stale threading._DummyThread bookkeeping for
+        already-exited Qt threads (CPython cannot observe a foreign thread's
+        death). This check runs shortly after each stop and logs the QThread's
+        OWN state, which is authoritative -- the next field session's log
+        settles the question. When the thread has genuinely finished, its
+        objects are reaped immediately instead of at the next Start.
+
+        ``thread`` is bound at schedule time so a quick Start of a NEW run
+        cannot be mistaken for the old thread failing to exit.
+        """
+        if thread is None or thread is not self.worker_thread:
+            return  # a new run has replaced it; the old refs are already gone
+        running = thread.isRunning()
+        finished = thread.isFinished()
+        py_threads = sorted(t.name for t in threading.enumerate())
+        logger.info(
+            f"Worker teardown check #{attempt}: qthread.isRunning={running}, "
+            f"qthread.isFinished={finished}, python-visible threads={py_threads}"
+        )
+        if finished:
+            self._reap_worker()
+        elif attempt < 3:
+            QTimer.singleShot(
+                700, lambda: self._check_worker_teardown(thread, attempt + 1)
+            )
+        else:
+            logger.warning(
+                "Worker thread still running ~2s after monitoring stopped -- "
+                "possible zombie worker (crash-diagnosis evidence; see "
+                "_check_worker_teardown)"
+            )
     
     @Slot()
     def on_pause_resume_clicked(self):
@@ -537,8 +673,10 @@ class MainWindow(QMainWindow):
             tophat_radius=self.params.processing.tophat_radius,
             match_on_foreground=self.params.processing.match_on_foreground,
             foreground_completion_mode=self.params.processing.foreground_completion_mode,
-            energy_drop_fraction=self.params.processing.energy_drop_fraction,
-            energy_slope_threshold=self.params.processing.energy_slope_threshold,
+            stall_window=self.params.processing.stall_window,
+            stall_drop_fraction=self.params.processing.stall_drop_fraction,
+            stall_rel_tolerance=self.params.processing.stall_rel_tolerance,
+            stall_abs_tolerance=self.params.processing.stall_abs_tolerance,
 
             # Pattern 1 parameters (from central params)
             pattern_1_crop_rect=self._qrect_to_tuple(self.params.processing.crop_rect_pattern_1),
@@ -616,8 +754,11 @@ class MainWindow(QMainWindow):
         self.worker.session_reset.connect(self.on_session_reset)
         self.worker.save_plots_requested.connect(self.on_save_plots_requested)
         
-        # Status Signals
-        self.worker.status_update.connect(lambda text: self.status_bar.set_timed_status_text(text, 5))
+        # Status Signals. _on_status_update is a real @Slot so this is a native
+        # meta-connection: a lambda here would be the app's only Python-callable
+        # (GlobalReceiver) connection -- the machinery on the 2026-08-18 crash
+        # stack.
+        self.worker.status_update.connect(self._on_status_update)
         self.worker.persistent_status_update.connect(self.status_bar.set_status_text)
         
         # Image Display Signals
@@ -745,9 +886,9 @@ class MainWindow(QMainWindow):
         elif self._monitoring_paused:
             text = AppStyles.AppText.WINDOW_INFO_MONITORING_PAUSED  # "Monitoring paused"
         elif self._monitoring_detecting:
-            text = AppStyles.AppText.WINDOW_INFO_MONITORING_ACTIVE  # "Monitoring active..."
+            text = AppStyles.AppText.WINDOW_INFO_MONITORING_ACTIVE  # "Monitoring (patterning detected)..."
         else:
-            text = AppStyles.AppText.WINDOW_INFO_MONITORING_IDLE    # "Monitoring..."
+            text = AppStyles.AppText.WINDOW_INFO_MONITORING_IDLE    # "Monitoring (waiting for patterning)..."
         self.information_label_2.setText(text)
 
     @Slot(bool)
@@ -756,13 +897,34 @@ class MainWindow(QMainWindow):
         self._monitoring_detecting = active
         self._update_monitoring_message()
 
+    @Slot()
+    def _on_watchdog_heartbeat(self):
+        """1 s GUI heartbeat -> GuiWatchdog (native slot per house rule)."""
+        if self._gui_watchdog is not None:
+            self._gui_watchdog.beat()
+
+    @Slot()
+    def _stop_gui_watchdog(self):
+        """aboutToQuit: stop the watchdog thread (daemon exit is safe anyway)."""
+        if self._gui_watchdog is not None:
+            self._gui_watchdog.stop()
+
     # ========================================
     # Worker Signal Handlers - Control
     # ========================================
 
+    @Slot(str)
+    def _on_status_update(self, text: str):
+        """Timed status-bar text from the worker (native-slot connection)."""
+        self.status_bar.set_timed_status_text(text, 5)
+
     @Slot()
     def on_monitoring_started(self):
         """Handle monitoring_started signal from worker."""
+        # First queued worker->GUI delivery of a run: its breadcrumb missing
+        # after a "start-clicked" is the exact signature of the 2026-08-19
+        # main-thread freeze (frozen before the first delivery).
+        crash_breadcrumbs.drop("monitoring-confirmed")
         # Buttons already set when Start clicked, but confirm states
         self.start_button.setEnabled(False)
         self.pause_resume_button.setEnabled(True)
@@ -792,8 +954,15 @@ class MainWindow(QMainWindow):
 
         # Display message
         self.status_bar.set_status_text(message)
-        
+
         logger.info(f"Monitoring stopped: {message}")
+
+        # Diagnose (and, once finished, reap) the worker thread shortly after
+        # the stop instead of waiting for the next Start -- see
+        # _check_worker_teardown for the crash-evidence rationale.
+        QTimer.singleShot(
+            700, lambda t=self.worker_thread: self._check_worker_teardown(t)
+        )
     
     @Slot()
     def on_monitoring_paused(self):
@@ -810,7 +979,7 @@ class MainWindow(QMainWindow):
         """Handle monitoring_resumed signal from worker."""
         # Update button text to show Pause option
         self.pause_resume_button.setText("Pause")
-        # Catbug message -> back to "Monitoring..." / "Monitoring active..." per icon
+        # Catbug message -> back to "Monitoring (waiting for patterning)..." / "Monitoring (patterning detected)..." per icon
         self._monitoring_paused = False
         self._update_monitoring_message()
         logger.info("Monitoring resumed (worker confirmed)")
@@ -854,7 +1023,11 @@ class MainWindow(QMainWindow):
                 group_box.match_score_plot.figure.savefig(
                     plots_path / f"pattern_{i}_match_score.png", **save_kwargs
                 )
-            
+                # No foreground snapshot: the live plot was removed in v3.3.5;
+                # the full per-batch foreground/stall trace persists in
+                # metrics.csv (white_pixel_percentage, smoothed_foreground,
+                # running_peak, stall_latched).
+
             logger.info(f"Plot snapshots saved to {plots_dir}")
             self.status_bar.set_timed_status_text("Plot snapshots saved", 5)
             
@@ -882,7 +1055,7 @@ class MainWindow(QMainWindow):
         # The Top-Hat method emits a grayscale foreground map, not a binary image,
         # so title it honestly when that method is active.
         is_energy = self.params.processing.binarization_method.name == "TOPHAT_ENERGY"
-        title = "Top-Hat Foreground" if is_energy else "Binary RTM Image"
+        title = "Top-Hat Foreground Map" if is_energy else "Binary RTM Image"
         self.pattern_group_boxes[pattern_idx].rtm_plot.plot_image(
             image, title=title
         )
@@ -916,7 +1089,7 @@ class MainWindow(QMainWindow):
     def on_match_score_data_ready(self, x_data, y_data, pattern_idx):
         """Handle match_score_data_ready signal - update match score plot."""
         self.pattern_group_boxes[pattern_idx].match_score_plot.plot_data(x_data, y_data)
-    
+
     # ========================================
     # Worker Signal Handlers - Results
     # ========================================
@@ -932,6 +1105,12 @@ class MainWindow(QMainWindow):
         - is_complete, all_criteria_met, is_delay (bool)
         - slope_ok, match_ok, pixels_ok (bool, monitoring phase only) -- the
           worker's authoritative per-criterion pass/fail for the indicators
+        - pixels_via ("ABS"/"STALL"/None) -- which path satisfied the
+          foreground criterion on THIS round; drives the live "(stall)"
+          annotation
+        - stall_in_streak (bool) -- sticky: True if ANY round of the current
+          confirmation streak passed via the stall latch; makes the
+          annotation durable on the frozen completion panel
         - criteria_met_batch (int or None)
         - thresholds (if not delay)
         """
@@ -964,8 +1143,31 @@ class MainWindow(QMainWindow):
             white_pixels = results['white_pixels']
             
             results_widget.set_mean_slope_result(f"{mean_slope:.4f}", pattern_idx)
-            results_widget.set_match_score_result(f"{match_score:.4f}", pattern_idx)
-            results_widget.set_percent_pixels_result(f"{white_pixels:.2f}", pattern_idx)
+            results_widget.set_match_score_result(
+                "--" if match_score is None else f"{match_score:.4f}", pattern_idx
+            )
+            # Annotate the foreground criterion while it is passing via the
+            # stall latch (the trace has floored above the absolute threshold),
+            # so the operator can see WHICH path is satisfying it - shown from
+            # the first stall-latched round, not just at completion. On the
+            # completion round the sticky streak flag takes over: the panel
+            # freezes with THIS text, and a streak can mix ABS and STALL
+            # rounds, so keying the final render on pixels_via alone would
+            # leave the durable panel unannotated whenever the arbitrary last
+            # round happened to pass via ABS (UI review 2026-08-18) - the
+            # 5-second status message below is not a durable surface.
+            via_stall = (results.get('pixels_via') == "STALL"
+                         or (results.get('is_complete')
+                             and results.get('stall_in_streak')))
+            # "(stall)" renders on a SECOND line: the results panel reserves
+            # the two-line cell size at construction, so the annotation costs
+            # no window width (the right column absorbs the height in its
+            # existing stretch) and neither dimension moves mid-run.
+            results_widget.set_percent_pixels_result(
+                f"{white_pixels:.2f}\n(stall)" if via_stall
+                else f"{white_pixels:.2f}",
+                pattern_idx
+            )
 
             # Highlight each criterion using the worker's authoritative pass/fail
             # (honors enabled-checkboxes and the foreground completion mode), so the
@@ -977,7 +1179,8 @@ class MainWindow(QMainWindow):
             if slope_ok is None:
                 slope_ok = abs(mean_slope) <= results['mean_slope_threshold']
             if match_ok is None:
-                match_ok = match_score <= results['match_score_threshold']
+                match_ok = (match_score is not None
+                            and match_score <= results['match_score_threshold'])
             if pixels_ok is None:
                 pixels_ok = white_pixels <= results['max_pixels_threshold']
 
@@ -1006,6 +1209,19 @@ class MainWindow(QMainWindow):
             group_box = self.pattern_group_boxes[pattern_idx]
             group_box.mean_pixel_plot.mark_criteria_met(met_batch)
             group_box.match_score_plot.mark_criteria_met(met_batch)
+            # A stall-flagged completion means the stall latch was load-bearing
+            # on at least one round of the confirmation streak (the trace
+            # floored at or above the absolute threshold, e.g. an exposed grid
+            # bar) - say so explicitly. stall_in_streak is sticky across the
+            # streak, unlike pixels_via which reflects only the final round (a
+            # streak can mix ABS and STALL rounds when the raw value straddles
+            # the threshold). This block runs once per completion (the panel
+            # freezes right below), so the status fires exactly once.
+            if (results.get('is_complete')
+                    and results.get('stall_in_streak')):
+                self.status_bar.set_timed_status_text(
+                    f"Pattern {pattern_idx + 1}: Complete (foreground stalled)", 5
+                )
             self._results_frozen[pattern_idx] = True
 
     @Slot(int)
@@ -1079,6 +1295,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Save settings and clean up when the window is closed."""
+        # Breadcrumb first: a WATCHDOG dump during the shutdown wait below is
+        # then self-attributing (hang-on-close vs hang-mid-run).
+        crash_breadcrumbs.drop("close-event")
         # Stop the monitoring worker first so it can finalize any in-progress
         # save session before we tear down the window. (Does not stop the beam.)
         self._shutdown_worker()
@@ -1117,10 +1336,13 @@ class MainWindow(QMainWindow):
     def _get_script_root() -> Path:
         """
         Get the script root directory for saved data.
-        
-        Returns the directory containing the main script file.
+
+        Returns the directory containing the main script file (also the root
+        of the worker's cb_plant.json -- script_root is passed into
+        WorkflowWorker at Start). Single source:
+        script_modules.app_paths.
         """
-        return Path(sys.argv[0]).resolve().parent
+        return app_paths.script_root()
 
 
 def _qt_message_handler(mode, context, message):
@@ -1141,14 +1363,80 @@ def _qt_message_handler(mode, context, message):
             return
         if mode == QtMsgType.QtFatalMsg:
             logger.critical(f"Qt FATAL: {message}")
+            # The logger call above is only an ENQUEUE now (QueueHandler):
+            # Qt aborts the process the moment this handler returns, atexit
+            # never runs, and the listener thread may never drain the queue --
+            # so the fatal reason would be racy-lost, the exact blindness this
+            # handler exists to prevent. Write it synchronously through the
+            # kept-open raw faulthandler fd, which is the designated
+            # crash-time record.
+            if _FAULT_FP is not None:
+                try:
+                    _FAULT_FP.write(f"Qt FATAL: {message}\n")
+                    _FAULT_FP.flush()
+                except Exception:
+                    pass
         elif mode == QtMsgType.QtCriticalMsg:
             logger.error(f"Qt CRITICAL: {message}")
+            # Criticals often immediately precede an abort, and the queued-
+            # logger copy is exactly what is lost when the listener dies with
+            # the process (2026-08-18: the last enqueued records never reached
+            # the app log). Mirror them synchronously like fatals.
+            if _FAULT_FP is not None:
+                try:
+                    _FAULT_FP.write(f"Qt CRITICAL: {message}\n")
+                    _FAULT_FP.flush()
+                except Exception:
+                    pass
         elif mode == QtMsgType.QtWarningMsg:
             logger.warning(f"Qt WARNING: {message}")
         else:
             logger.info(f"Qt: {message}")
     except Exception:
         pass
+
+
+def _gc_marker(phase, info):
+    """
+    Crash forensics (2026-08-18 abort follow-up): an unmatched "GC start gen=2"
+    line adjacent to a faulthandler dump proves the abort ran inside a full
+    cyclic collection (the GC-timed Qt-destructor hypothesis); its absence at
+    the next crash refutes that. Gen-2 collections are rare, so two buffered
+    local-disk writes per collection are negligible. Keep this allocation-light
+    and never raise -- it runs inside the collector.
+    """
+    try:
+        if info.get("generation") == 2 and _FAULT_FP is not None:
+            _FAULT_FP.write(
+                "GC start gen=2\n" if phase == "start" else "GC stop gen=2\n"
+            )
+            _FAULT_FP.flush()
+    except Exception:
+        pass
+
+
+def _install_unraisable_hook():
+    """
+    Mirror unraisable errors (destructor/__del__ exceptions -- the kind raised
+    during GC-time finalization) synchronously into the crash record, then
+    chain to the previous hook. A future abort preceded by an UNRAISABLE line
+    names the exact object being finalized.
+    """
+    prev = sys.unraisablehook
+
+    def _unraisable_to_fault_fd(unraisable):
+        if _FAULT_FP is not None:
+            try:
+                _FAULT_FP.write(
+                    f"UNRAISABLE: {unraisable.exc_value!r} "
+                    f"in {unraisable.object!r}\n"
+                )
+                _FAULT_FP.flush()
+            except Exception:
+                pass
+        prev(unraisable)
+
+    sys.unraisablehook = _unraisable_to_fault_fd
 
 
 def _qt_version_safe() -> str:
@@ -1160,62 +1448,369 @@ def _qt_version_safe() -> str:
         return "unknown"
 
 
+def _local_logs_dir() -> Path:
+    """
+    Local-disk directory (%LOCALAPPDATA%/ATC_Monitor/logs). Two roles:
+
+    1. Home of faulthandler.log, ALWAYS. It is written through a raw kept-open
+       fd at crash time; a hung SMB write at that moment would hang the crash
+       dump itself, so the crash-time record must never live on the network
+       share. Non-trivial content is swept into <script dir>/logs/
+       faulthandler.log at the next startup (see _mirror_fault_log).
+    2. Fallback for the rotating app log when <script dir>/logs (the primary
+       since v3.3.2, see _script_logs_dir) cannot be created or written.
+
+    History: pre-3.3.2 the rotating app log lived here too, as part of the fix
+    for the 2026-08-14 heap-corruption crash (0xc0000374) that died in
+    worker-thread RotatingFileHandler.shouldRollover -> os.path.exists on the
+    UNC share. The queue indirection (a single listener thread owns ALL file
+    I/O, see setup_logging) is what actually removes that stack from worker
+    threads, so the app log could move back beside the script; local disk
+    remains the crash-time and fallback location.
+
+    Single source: script_modules.app_paths.
+    """
+    return app_paths.local_logs_dir()
+
+
+# Cap on how much crash residue one startup sweep copies to the script dir; a
+# fault log this large means many unswept crashes -- the newest tail is the
+# diagnostic that matters, and an unbounded SMB write at startup is not.
+_FAULT_MIRROR_MAX_BYTES = 1_000_000
+
+# Cap on the script-dir mirror FILE itself -- the one append-only log with no
+# rotation. Since the v3.3.6 breadcrumbs every session appends a trail (a few
+# KB), not just crashes, so without this the mirror grows forever.
+_FAULT_MIRROR_FILE_CAP_BYTES = 5_000_000
+
+
+def _trim_fault_mirror(mirror_path):
+    """
+    Keep the fault-log mirror bounded by ROTATING it (rename to .1) when it
+    outgrows the cap; the caller's append then recreates a fresh file. A
+    rotation never destroys bytes -- the mirror is shared by every machine
+    launched from one deployment, and an in-place read-trim-rewrite could
+    silently discard a sweep another host appended mid-rewrite (the exact
+    loss mode the local-file sweep is engineered against). os.replace is
+    atomic; if another host holds the file open the rename fails and the
+    file is simply left over-cap until a quieter launch (an over-cap mirror
+    beats a lost sweep). Retention: newest cycle in faulthandler.log,
+    previous cycle in faulthandler.log.1.
+    """
+    try:
+        if (not mirror_path.exists()
+                or mirror_path.stat().st_size <= _FAULT_MIRROR_FILE_CAP_BYTES):
+            return
+        mirror_path.replace(mirror_path.with_name(mirror_path.name + ".1"))
+    except Exception:
+        logger.warning("Fault-log mirror rotation failed; appending anyway",
+                       exc_info=True)
+
+
+def _fault_log_has_content(text: str) -> bool:
+    """
+    True iff the fault log holds anything beyond armed banners and blank
+    lines -- i.e. actual crash residue worth mirroring. Every launch appends
+    one "==== faulthandler armed pid=N ====" banner (see setup_logging), so a
+    file of nothing but banners means the prior runs exited cleanly.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if (stripped.startswith("==== faulthandler armed pid=")
+                and stripped.endswith("====")):
+            continue
+        return True
+    return False
+
+
+def _mirror_fault_log(local_logs, script_logs) -> None:
+    """
+    One-shot startup sweep of crash residue from the LOCAL faulthandler.log
+    into <script dir>/logs/faulthandler.log, putting native-crash evidence
+    beside the app log that gets read in the field. Crash-time writes stay
+    local (see _local_logs_dir); only this after-the-fact copy touches the
+    share, at startup, where a slow SMB write is harmless.
+
+    Must run BEFORE the faulthandler-open block in setup_logging: a
+    successful mirror truncates the local file, and that has to happen before
+    _FAULT_FP reopens it for append and writes this run's armed banner.
+
+    Never raises -- a failed mirror must not abort startup, and on any mirror
+    failure the local copy is left untouched so the residue survives for the
+    next attempt. The reverse failure (mirrored but could not truncate) is a
+    warning only and keeps the mirror: a duplicated block on the next sweep
+    beats a lost one (duplicate-tolerant by design).
+
+    Only the bytes actually read are removed afterwards, never the whole file:
+    a second instance may be running with this file open for append, and its
+    crash dump must survive this sweep.
+    """
+    try:
+        if local_logs is None:
+            return
+        local_path = local_logs / "faulthandler.log"
+        if not local_path.exists():
+            return
+        try:
+            swept = local_path.read_text(encoding="utf-8", errors="replace")
+            text = swept
+            if not _fault_log_has_content(text):
+                # Banner-only residue (~45 bytes per launch): nothing to say,
+                # so write nothing -- and do NOT truncate, the banners are
+                # the per-launch arming record.
+                return
+            if script_logs is None:
+                logger.warning(
+                    "Fault-log residue in %s could not be mirrored: no "
+                    "script-dir logs location", local_path)
+                return
+            truncated = len(text) > _FAULT_MIRROR_MAX_BYTES
+            if truncated:
+                text = text[-_FAULT_MIRROR_MAX_BYTES:]
+            script_logs.mkdir(parents=True, exist_ok=True)
+            _trim_fault_mirror(script_logs / "faulthandler.log")
+            # host= and app= for the same reason as the LAUNCH banner: several
+            # machines launched from one share directory append to one file.
+            header = (
+                f"\n==== mirrored from {local_path} at "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"host={platform.node()} app={APP_VERSION}"
+                + (f" (truncated to last {_FAULT_MIRROR_MAX_BYTES} bytes)"
+                   if truncated else "")
+                + " ====\n"
+            )
+            with open(script_logs / "faulthandler.log", "a",
+                      encoding="utf-8") as mirror_fp:
+                mirror_fp.write(header + text)
+                mirror_fp.flush()
+        except Exception:
+            logger.warning(
+                "Fault-log mirror to script dir failed; local copy kept: %s",
+                local_path, exc_info=True)
+            return
+        # Reset the local file ONLY now that the mirror fully succeeded, and
+        # drop ONLY the bytes actually mirrored: another instance of the app
+        # can be running with this file open for append (it is shared per
+        # account), and a blind truncate would silently destroy a crash dump it
+        # wrote while the SMB append above was in flight -- the single
+        # highest-value diagnostic. Anything appended since is carried forward
+        # for the next sweep instead.
+        try:
+            with open(local_path, "r+", encoding="utf-8", errors="replace") as fp:
+                current = fp.read()
+                remainder = (current[len(swept):]
+                             if current.startswith(swept) else current)
+                fp.seek(0)
+                fp.write(remainder)
+                fp.truncate()
+        except Exception:
+            logger.warning(
+                "Mirrored fault log but could not reset local copy: %s",
+                local_path, exc_info=True)
+        logger.info("Mirrored %d bytes of fault-log residue to %s",
+                    len(text), script_logs / "faulthandler.log")
+    except Exception:
+        logger.warning("Fault-log mirror failed", exc_info=True)
+
+
+def _script_logs_dir() -> Path:
+    """
+    Primary app-log directory: <script dir>/logs (usually on the UNC share the
+    app is launched from). Safe for the rotating app log since v3.3.1 because
+    only the single QueueListener thread ever touches the file -- worker
+    threads only enqueue, so the 2026-08-14 crash stack (worker-thread SMB
+    I/O) cannot recur. Matches the cryo-utilities convention of file output
+    beside the script and puts the log next to the Saved_Data folder.
+
+    Single source: script_modules.app_paths (same sys.argv[0]-based root as
+    MainWindow._get_script_root, used for saved data and the learned CB plant
+    file).
+    """
+    return app_paths.script_logs_dir()
+
+
+# ---- Console policy --------------------------------------------------------
+# Applies to the stderr sink ONLY; the rotating file log always receives full
+# INFO telemetry (Auto CB traces, match scores -- the field-diagnosis record).
+#   quiet console:    _CONSOLE_LEVEL = logging.WARNING
+#   key events only:  _CONSOLE_LEVEL = logging.INFO (default, with noise filter)
+#   silent console:   _CONSOLE_LEVEL = logging.ERROR
+_CONSOLE_LEVEL = logging.INFO
+_CONSOLE_FMT = "%(asctime)s %(levelname)-8s %(message)s"
+_CONSOLE_DATEFMT = "%H:%M:%S"
+
+
+class _ConsoleNoiseFilter(logging.Filter):
+    """
+    Console-side quieting only: attached to the stderr StreamHandler, never to
+    the file handler or the root logger, so every category below still reaches
+    the file log at INFO (needed for field diagnosis).
+
+    Blocklist semantics -- allow everything except known-noisy message
+    families, matched by substring (several carry a variable "Pattern N: "
+    prefix, so startswith would miss them). Fails open, and WARNING and above
+    ALWAYS pass, so the filter can never hide a warning/error.
+    """
+
+    NOISY_SUBSTRINGS = (
+        "sparse-fallback:",            # per-tile score dumps (image_pattern_matching)
+        "Microscope data read:",       # telemetry dict dump (workflow_worker)
+        "Updated global parameters:",  # per-tick params echo (atc_monitor)
+        "crop updated:",               # per-drag crop echo (atc_monitor)
+        "Scan direction set to",       # RTM overlay update (rtm_plot_widget)
+        "Auto CB:",                    # calibration step notes (full trace in file)
+        "Qt: ",                        # Qt info catch-all (_qt_message_handler)
+        "Worker teardown check",       # crash-diagnosis residue (atc_monitor)
+        "Post-connect:",               # thread-list dump (fib_patterning_monitor)
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if record.levelno >= logging.WARNING:
+                return True
+            msg = record.getMessage()
+            return not any(s in msg for s in self.NOISY_SUBSTRINGS)
+        except Exception:
+            return True
+
+
 def setup_logging():
     """
-    Configure logging: stderr (as before) PLUS a durable rotating file log and
-    native-fault capture to a file.
+    Configure logging: a concise stderr console PLUS a durable rotating file
+    log (in <script dir>/logs, falling back to %LOCALAPPDATA%/ATC_Monitor/logs,
+    fed through a queue so no worker thread ever performs file I/O) and
+    native-fault capture to a LOCAL file. Crash residue a previous run left
+    in that local file is swept into <script dir>/logs here at startup, so
+    all field-readable evidence ends up in one place (see _mirror_fault_log).
 
     Why the file outputs matter: this is a windowed GUI app, so when it is
     launched without an attached console, stderr goes nowhere visible. A native
     crash (e.g. a fault inside the AutoScript C transport) then closes the window
     with "nothing in the console" and no record at all. Writing the app log and
-    the faulthandler traceback to files under ./logs makes such a crash leave
-    durable on-disk evidence (the C+Python stack at the fault point) instead of
-    dying silently.
-    """
-    global _FAULT_FP
+    the faulthandler traceback to files makes such a crash leave durable
+    on-disk evidence instead of dying silently.
 
-    logs_dir = Path(sys.argv[0]).resolve().parent / "logs"
+    Why the queue: emitting a record must never do file (SMB!) I/O on the
+    calling thread. A QueueHandler makes every logger call a lock-free enqueue;
+    a single QueueListener thread owns the actual stderr + rotating-file
+    handlers -- which is what makes a rotating log on the launch share safe.
+    Trade-offs (accepted): records still in the queue at a HARD crash are lost
+    -- the faulthandler file, written through a raw kept-open fd on LOCAL
+    disk, is the crash-time record. An SMB stall pauses only the listener
+    thread while records buffer in the unbounded in-memory queue; do NOT
+    bound the queue -- a blocking put would reintroduce worker-thread stalls.
+    """
+    global _FAULT_FP, _LOG_LISTENER
+
+    # Resolve both candidate directories defensively -- logging setup must
+    # never crash the app, whatever sys.argv[0] or the environment look like.
     try:
-        logs_dir.mkdir(parents=True, exist_ok=True)
+        script_logs = _script_logs_dir()
     except Exception:
-        # Never let logging setup itself crash the app; fall back to stderr-only.
-        logs_dir = None
+        script_logs = None
+    try:
+        local_logs = _local_logs_dir()
+    except Exception:
+        local_logs = None
 
     # process id + thread name in every record so two separate-process runs
-    # (launch 1 vs launch 2) and GUI vs worker thread are attributable in one
-    # appended file -- the crux of diagnosing the intermittent first-Start crash.
+    # (launch 1 vs launch 2 -- possibly on different machines now that the log
+    # can live on a shared script directory; see host= in the banner) and GUI
+    # vs worker thread are attributable in one appended file -- the crux of
+    # diagnosing the intermittent first-Start crash.
     fmt = "%(asctime)s\t%(process)d\t%(threadName)s\t%(levelname)s\t%(name)s\t%(funcName)s\t%(message)s"
 
-    handlers = [logging.StreamHandler()]
-    if logs_dir is not None:
+    # Console (stderr) sink: concise format, own level + noise filter.
+    # Console policy never affects the file sink.
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(_CONSOLE_LEVEL)
+    console_handler.addFilter(_ConsoleNoiseFilter())
+    console_handler.setFormatter(
+        logging.Formatter(_CONSOLE_FMT, datefmt=_CONSOLE_DATEFMT))
+
+    sink_handlers: list[logging.Handler] = [console_handler]
+    app_log_path = None
+    # delay=False on purpose: the file open happens HERE, once, at startup --
+    # an unreachable share fails fast and falls through to the local fallback,
+    # instead of failing later on the listener thread mid-run.
+    for candidate_dir in (script_logs, local_logs):
+        if candidate_dir is None:
+            continue
         try:
-            # Rotating so the log cannot grow unbounded (~25 MB cap). StreamHandler
-            # (and thus FileHandler) flushes after every record, so the file
-            # survives a hard crash up to the fault point.
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            # Rotating so the log cannot grow unbounded (~25 MB cap).
             file_handler = RotatingFileHandler(
-                logs_dir / "atc_monitor.log",
+                candidate_dir / "atc_monitor.log",
                 maxBytes=5_000_000, backupCount=5, encoding="utf-8", delay=False,
             )
             file_handler.setFormatter(logging.Formatter(fmt))
-            handlers.append(file_handler)
+            sink_handlers.append(file_handler)
+            app_log_path = candidate_dir / "atc_monitor.log"
+            break
         except Exception:
-            logger.warning("Could not create rotating file log handler", exc_info=True)
+            continue  # try the next candidate; stderr-only if all fail
+
+    try:
+        log_queue = queue.SimpleQueue()
+        listener = QueueListener(log_queue, *sink_handlers,
+                                 respect_handler_level=True)
+        listener.start()
+        atexit.register(listener.stop)
+        _LOG_LISTENER = listener
+        root_handlers = [QueueHandler(log_queue)]
+    except Exception:
+        # Fall back to direct handlers rather than lose logging entirely.
+        root_handlers = sink_handlers
 
     logging.basicConfig(
         format=fmt,
         level=logging.INFO,
         force=True,
-        handlers=handlers,
+        handlers=root_handlers,
     )
+    # basicConfig stamps `fmt` onto the handlers it is given -- but a
+    # QueueHandler must NOT carry the full formatter: its prepare() bakes the
+    # formatted text into record.msg BEFORE the listener's sinks format the
+    # record again (observed as double-prefixed lines). Message-only here;
+    # the sinks own the real format. (Exception text is still serialized into
+    # the message by prepare(), which is exactly what we want off-thread.)
+    for handler in root_handlers:
+        if isinstance(handler, QueueHandler):
+            handler.setFormatter(logging.Formatter("%(message)s"))
 
-    # Launch banner -- first record of each run, so runs in the appended file can
-    # be told apart and the environment (Python/Qt/OS) is captured for triage.
+    # faulthandler ALWAYS lives on local disk: it writes through the raw fd at
+    # crash time, and a hung SMB write at that moment would hang the crash
+    # dump itself. Residue is mirrored to the script dir at next startup
+    # (_mirror_fault_log below).
+    fault_dir = local_logs
+    if fault_dir is not None:
+        try:
+            fault_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            fault_dir = None
+
+    # Launch banner -- first record of each run, so runs in the appended file
+    # can be told apart and the environment (Python/Qt/OS) is captured for
+    # triage. host= because two machines launched from the same share directory
+    # append to the same file (pid alone no longer disambiguates).
     logger.info(
-        "LAUNCH app=3.3.0 pid=%s exe=%s py=%s qt=%s platform=%s",
-        os.getpid(), sys.executable,
+        "LAUNCH app=%s pid=%s host=%s exe=%s py=%s qt=%s platform=%s",
+        APP_VERSION, os.getpid(), platform.node(), sys.executable,
         sys.version.replace("\n", " "), _qt_version_safe(), platform.platform(),
     )
+    logger.info("App log file: %s",
+                app_log_path if app_log_path is not None else "(stderr only)")
+    logger.info("Fault log file: %s",
+                (fault_dir / "faulthandler.log") if fault_dir is not None
+                else "(stderr)")
+    if app_log_path is None:
+        logger.warning("No writable log directory (script dir or local app "
+                       "data); file logging disabled")
+    elif script_logs is None or app_log_path.parent != script_logs:
+        logger.warning("Script-directory logs unavailable; using local "
+                       "fallback: %s", app_log_path)
 
     # Capture Qt's own fatal/critical messages (names the exact qFatal reason if
     # a Qt assertion ever aborts the process).
@@ -1223,6 +1818,12 @@ def setup_logging():
         qInstallMessageHandler(_qt_message_handler)
     except Exception:
         logger.warning("Could not install Qt message handler", exc_info=True)
+
+    # Sweep the previous run's crash residue into the script directory BEFORE
+    # arming faulthandler: a successful sweep truncates the local file, which
+    # must happen before _FAULT_FP reopens it for append and writes this
+    # run's armed banner. Ordering is load-bearing.
+    _mirror_fault_log(fault_dir, script_logs)
 
     # Dump a Python+C traceback (all threads) if the process is killed by a native
     # fault (e.g. inside the AutoScript C transport), which a normal try/except
@@ -1232,13 +1833,17 @@ def setup_logging():
     # never overwrites launch 1's fault. This is the single highest-value
     # diagnostic -- it converts a silent native death into a stack trace on disk.
     try:
-        if logs_dir is not None:
+        if fault_dir is not None:
             _FAULT_FP = open(
-                logs_dir / "faulthandler.log", "a", buffering=1, encoding="utf-8"
+                fault_dir / "faulthandler.log", "a", buffering=1, encoding="utf-8"
             )
             _FAULT_FP.write(f"\n==== faulthandler armed pid={os.getpid()} ====\n")
             _FAULT_FP.flush()
             faulthandler.enable(file=_FAULT_FP, all_threads=True)
+            # Run-lifecycle breadcrumbs share the crash fd: the queued app log
+            # loses its final records on a hard crash (2026-08-19 left a
+            # 1-37 s blind spot), the synchronous breadcrumb trail does not.
+            crash_breadcrumbs.set_fp(_FAULT_FP)
         else:
             faulthandler.enable(all_threads=True)  # fall back to stderr
     except Exception:
@@ -1247,6 +1852,18 @@ def setup_logging():
             faulthandler.enable(all_threads=True)  # last-resort fallback
         except Exception:
             pass
+
+    # Crash forensics companions to faulthandler (2026-08-18 abort follow-up):
+    # mark full GC collections and unraisable finalizer errors in the same
+    # synchronous crash record. Both are no-ops on the happy path.
+    try:
+        gc.callbacks.append(_gc_marker)
+    except Exception:
+        logger.warning("Could not register GC crash marker", exc_info=True)
+    try:
+        _install_unraisable_hook()
+    except Exception:
+        logger.warning("Could not install unraisable-error hook", exc_info=True)
 
 
 def _install_excepthook(window: "MainWindow"):
@@ -1297,6 +1914,24 @@ def main():
 
     # Install the global handler now that we have a window to clean up through.
     _install_excepthook(window)
+
+    # GUI responsiveness watchdog (2026-08-19 hang-then-kill follow-up): a 1 s
+    # heartbeat on the GUI thread + a daemon poller that writes an all-thread
+    # stack dump to the crash fd if the heartbeat stalls >10 s -- the only
+    # instrument that survives a TerminateProcess kill of a ghosted window.
+    # Gated on the crash fd: a watchdog dumping to a windowed app's stderr is
+    # worthless. Started here, NOT in setup_logging (tests re-run that against
+    # temp dirs and close _FAULT_FP in tearDown).
+    if _FAULT_FP is not None:
+        window._gui_watchdog = GuiWatchdog(_FAULT_FP)
+        window._heartbeat_timer = QTimer(window)
+        window._heartbeat_timer.setInterval(1000)
+        window._heartbeat_timer.timeout.connect(window._on_watchdog_heartbeat)
+        window._heartbeat_timer.start()
+        window._gui_watchdog.start()
+        app.aboutToQuit.connect(window._stop_gui_watchdog)
+    else:
+        logger.warning("GUI watchdog disabled: no crash fd available")
 
     window.show()
     sys.exit(app.exec())

@@ -17,8 +17,23 @@ import threading
 from dataclasses import dataclass
 from enum import Enum, auto
 
+from script_modules.results_evaluation import (
+    StallConfig, evaluate_foreground_stall
+)
+
 
 logger = logging.getLogger(__name__)
+
+
+# Display names for machine-generated parameter names in user-facing status
+# messages. Fallback for unmapped names: title-cased snake_case.
+PARAM_DISPLAY_NAMES = {
+    "number_of_images": "Number of Images",
+    "analysis_interval_seconds": "Analysis Interval",
+    "mean_slope_enabled": "Mean Slope",
+    "match_score_enabled": "Match Score",
+    "percent_pixels_enabled": "Percent Pixels",
+}
 
 
 # ===========================
@@ -180,7 +195,7 @@ class WorkerParameterManager:
                 old_value = self._pending_updates[existing_index].value
                 self._pending_updates[existing_index] = update
                 logger.info(
-                    f"Parameter update replaced: {param_name} = {old_value} → {value} "
+                    f"Parameter update replaced: {param_name} = {old_value} -> {value} "
                     f"(pattern_idx={pattern_idx}, impact={update.impact.name})"
                 )
             else:
@@ -264,7 +279,7 @@ class WorkerParameterManager:
                     f"Stored {update.param_name}={update.value} "
                     f"(Pattern {update.pattern_idx + 1} not yet active)"
                 )
-                return f"Stored {update.param_name}={update.value} for future use"
+                return f"Stored {update.param_name.replace('_', ' ')} = {update.value} for future use"
             affected_patterns = [pattern_states[update.pattern_idx]]
             pattern_label = f"Pattern {update.pattern_idx + 1}"
         
@@ -352,16 +367,54 @@ class WorkerParameterManager:
         Keeps: Accumulated data
         """
         for ps in affected_patterns:
+            # No-op change: an identical rect must not reset the reference,
+            # confirmation, or the stall latch's history.
+            if update.value is not None and ps.crop_rect is not None \
+                    and tuple(update.value) == tuple(ps.crop_rect):
+                continue
+
             # Update crop rectangle
             ps.crop_rect = update.value
+            # Record when it took effect: updates apply at a batch boundary, so the
+            # new rect first governs batch (batch_count + 1).
+            ps.crop_rect_history.append({
+                "batch": ps.batch_count + 1,
+                "rect": list(update.value) if update.value else None,
+            })
 
             # Reset reference template (will be recaptured)
             ps.reference_template = None
 
-            # Reset the RELATIVE_PLATEAU energy baseline: the new crop is a new
-            # region/scale, so the start-of-monitoring foreground reference must
-            # be recaptured on the next batch.
-            ps.initial_white_pixels = None
+            # Restart the stall latch's view of the foreground history: the new
+            # crop is a new region/scale, so the running peak and flat window
+            # must not span the change. If the trace had ALREADY dropped from
+            # its peak, carry that state across the reset (see
+            # apply_stall_carry) -- otherwise a crop nudge on an already-floored
+            # gridbar trace would permanently disarm the latch in its flagship
+            # scenario, with re-latching impossible because the post-crop slice
+            # has no peak to have dropped from.
+            pre_crop_slice = ps.white_pixel_percentages[ps.stall_history_start:]
+            if pre_crop_slice:
+                pre_crop_stall = evaluate_foreground_stall(
+                    pre_crop_slice,
+                    StallConfig(
+                        stall_window=getattr(parameters, "stall_window", 16),
+                        stall_drop_fraction=getattr(
+                            parameters, "stall_drop_fraction", 0.35),
+                        stall_rel_tolerance=getattr(
+                            parameters, "stall_rel_tolerance", 0.10),
+                        stall_abs_tolerance=getattr(
+                            parameters, "stall_abs_tolerance", 0.15),
+                    ),
+                )
+                if pre_crop_stall.dropped:
+                    ps.stall_dropped_carry = True
+                    logger.warning(
+                        "Stall latch history reset by crop change while the "
+                        "foreground trace was already dropped - carrying the "
+                        "dropped state so the latch can re-arm after the change"
+                    )
+            ps.stall_history_start = len(ps.white_pixel_percentages)
 
             # Reset confirmation counter
             if ps.evaluation_state:
@@ -399,10 +452,10 @@ class WorkerParameterManager:
                         f"clamped to {update.value}"
                     )
             
-            return f"Confirmation rounds changed to {update.value}"
+            return f"Confirmation rounds updated to {update.value}"
         
         # Other monitoring parameters (shouldn't happen with current UI)
-        param_display = update.param_name.replace('_', ' ').title()
+        param_display = PARAM_DISPLAY_NAMES.get(update.param_name, update.param_name.replace('_', ' ').title())
         return f"{param_display} updated to {update.value}"
     
     def _apply_deferred_update(
@@ -419,7 +472,7 @@ class WorkerParameterManager:
         # Update parameter but don't affect current session
         setattr(parameters, update.param_name, update.value)
         
-        param_display = update.param_name.replace('_', ' ').title()
+        param_display = PARAM_DISPLAY_NAMES.get(update.param_name, update.param_name.replace('_', ' ').title())
         return f"{param_display} updated to {update.value} (applies to next patterning session)"
     
     def get_pending_update_summary(self) -> str:
@@ -481,7 +534,7 @@ def validate_parameter_update(param_name: str, value: object) -> tuple[bool, str
     # Thresholds should be positive numbers
     if 'threshold' in param_name.lower():
         if not isinstance(value, (int, float)) or value < 0:
-            return False, f"Threshold must be a positive number, got {value}"
+            return False, f"Threshold must be a non-negative number, got {value}"
         return True, ""
     
     # Confirmation rounds should be positive integer

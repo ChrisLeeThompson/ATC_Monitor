@@ -246,7 +246,7 @@ class PatternMatchPlotWidget(BasePlotWidget):
         self._style_axes(self.ax)
         
         # Restore labels and title
-        self.ax.set_title("Pattern Match Score", fontsize=AppStyles.Dimensions.PLOT_TITLE_FONT_SIZE)
+        self.ax.set_title("Match Score", fontsize=AppStyles.Dimensions.PLOT_TITLE_FONT_SIZE)
         
         # Recreate threshold line after clearing
         self._create_match_score_threshold_line()

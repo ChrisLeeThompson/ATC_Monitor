@@ -105,7 +105,7 @@ class ControlsGroupBox(QGroupBox):
             initial_value=self.initial_values.match_score_threshold
         )
         # Maximum pixels threshold (label text is mode-aware: the main window
-        # relabels it to "Max Foreground Energy" when the Top-Hat method is active,
+        # relabels it to "Maximum Foreground Energy" when the Top-Hat method is active,
         # since that metric is a continuous energy, not a white-pixel percentage)
         self.maximum_pixels_threshold_label = QLabel("Maximum Pixels Threshold")
         self.maximum_pixels_threshold_spinbox = MaximumPixelsThreshold(
@@ -233,7 +233,9 @@ class ControlsGroupBox(QGroupBox):
         Emits the control_parameters_changed signal with current values.
         """
         params = self.get_control_parameters()
-        logger.info(f"Control parameters changed: {params}")
+        # DEBUG: same dict is logged one signal-hop later by MainWindow as
+        # "Updated global parameters" -- keep only one INFO record per change.
+        logger.debug(f"Control parameters changed: {params}")
         self.control_parameters_changed.emit(params)
     
     def get_control_parameters(self) -> dict:
@@ -273,7 +275,7 @@ class ControlsGroupBox(QGroupBox):
         if was_clamped:
             self.analysis_interval_seconds_spinbox.setStyleSheet(AppStyles.SpinBox.auto_adjusted())
             self.analysis_interval_seconds_spinbox.setToolTip(
-                f"Adjusted to {adjusted_seconds}s (image rate constraint)"
+                f"Adjusted to {adjusted_seconds}s (limited by the RTM image rate)."
             )
         else:
             self.analysis_interval_seconds_spinbox.setStyleSheet(AppStyles.SpinBox.default())
@@ -346,7 +348,7 @@ class ControlsGroupBox(QGroupBox):
 
         The main window calls this to keep the label honest per binarization
         method: "Maximum Pixels Threshold" for the white-pixel methods,
-        "Max Foreground Energy" for the Top-Hat continuous-energy method.
+        "Maximum Foreground Energy" for the Top-Hat continuous-energy method.
 
         :param text: Label text to display
         """

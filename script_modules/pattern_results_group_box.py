@@ -15,6 +15,15 @@ from script_modules.app_styles import AppStyles
 
 logger = logging.getLogger(__name__)
 
+# Largest content each grid cell can ever show; reserving its size up front
+# keeps the window from resizing mid-run (the "(stall)" annotation on a
+# frozen results panel used to widen the whole window permanently, because
+# the grid's minimum size tracked its largest-ever content). "(stall)"
+# renders on a second line, so the reservation is two lines tall and only
+# one value wide.
+_LARGEST_RESULT_TEXT = "100.00\n(stall)"      # percent-pixels row, stall-latch completion
+_WIDEST_CRITERION_TEXT = "Foreground Energy"  # criterion checkbox flips with binarization method
+
 
 class PatternResultsGroupBox(QGroupBox):
 
@@ -110,6 +119,12 @@ class PatternResultsGroupBox(QGroupBox):
         self.mean_slope_checkbox.setToolTip(AppStyles.AppToolTips.MEAN_SLOPE_CHECKBOX)
         self.match_score_checkbox.setToolTip(AppStyles.AppToolTips.MATCH_SCORE_CHECKBOX)
         self.percent_pixels_checkbox.setToolTip(AppStyles.AppToolTips.PERCENT_PIXELS_CHECKBOX)
+        # The percent-pixels values carry the "(stall)" completion annotation;
+        # the tooltip explains it (the other result values have none to explain).
+        self.p1_percent_pixels_result_label.setToolTip(
+            AppStyles.AppToolTips.PERCENT_PIXELS_RESULT)
+        self.p2_percent_pixels_result_label.setToolTip(
+            AppStyles.AppToolTips.PERCENT_PIXELS_RESULT)
 
     def _setup_connections(self):
         """Connect checkbox state changes to emit criteria_enabled_changed."""
@@ -138,6 +153,31 @@ class PatternResultsGroupBox(QGroupBox):
         )
         grid_layout.setHorizontalSpacing(AppStyles.Dimensions.GRID_LAYOUT_HSPACING)
         grid_layout.setVerticalSpacing(AppStyles.Dimensions.GRID_LAYOUT_VSPACING)
+        # Reserve each cell's size for the largest content it can ever show,
+        # so the two-line "100.00\n(stall)" result or the "Foreground Energy"
+        # criterion label never grows the layout minimum and resizes the
+        # window mid-run. Measured on the REAL widgets -- stylesheet fonts,
+        # checkbox indicator and spacing included -- by setting the largest
+        # strings, taking the size hints, and restoring (font-metrics math
+        # under-reserved: stylesheet fonts and indicator spacing are not
+        # visible to QFontMetrics on the widget font).
+        saved_checkbox_text = self.percent_pixels_checkbox.text()
+        saved_label_text = self.p1_percent_pixels_result_label.text()
+        self.percent_pixels_checkbox.setText(_WIDEST_CRITERION_TEXT)
+        self.p1_percent_pixels_result_label.setText(_LARGEST_RESULT_TEXT)
+        grid_layout.setColumnMinimumWidth(
+            0, self.percent_pixels_checkbox.sizeHint().width() + 4)
+        largest_hint = self.p1_percent_pixels_result_label.sizeHint()
+        value_width = largest_hint.width() + 4   # widest LINE of the two
+        grid_layout.setColumnMinimumWidth(1, value_width)
+        grid_layout.setColumnMinimumWidth(2, value_width)
+        # Two-line height reservation on both percent-pixels labels: without
+        # it the row would grow downward when "(stall)" lands -- the same
+        # mid-run jump, rotated vertically.
+        self.p1_percent_pixels_result_label.setMinimumHeight(largest_hint.height())
+        self.p2_percent_pixels_result_label.setMinimumHeight(largest_hint.height())
+        self.percent_pixels_checkbox.setText(saved_checkbox_text)
+        self.p1_percent_pixels_result_label.setText(saved_label_text)
         # Add components to grid layout
         grid_layout.addWidget(self.pattern1_label, 0, 1, alignment=Qt.AlignmentFlag.AlignCenter)
         grid_layout.addWidget(self.pattern2_label, 0, 2, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -289,7 +329,7 @@ class PatternResultsGroupBox(QGroupBox):
         for idx in indices:
             label = self._get_label('confirmation_rounds', idx)
             label.setText(f"/{total}")
-        logger.info(f"Confirmation Rounds total set to: /{total} "
+        logger.info(f"Confirmation rounds total set to {total} "
                     f"(pattern_idx={pattern_idx})")
 
     def update_confirmation_rounds_progress(self, current: int, total: int, pattern_idx: int = 0):

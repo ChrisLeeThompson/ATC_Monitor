@@ -62,7 +62,7 @@ class PatternTwoGroupBox(QGroupBox):
             threshold_max=self._threshold_max
             )
         self.match_score_plot.setObjectName("Pattern 2 Match Score Plot")
-    
+
     def _setup_connections(self):
         """Setup signal connections."""
         # RTM crop rectangle changes
@@ -82,7 +82,9 @@ class PatternTwoGroupBox(QGroupBox):
         """
         sender = self.sender()  # Get the widget that sent the signal
         sender_name = sender.objectName() if sender else "Unknown"
-        logger.info(f"{sender_name}: New crop -> Width: {width}, Height: {height} at ({x}, {y})")
+        # DEBUG: widget-level duplicate of the authoritative "crop updated"
+        # record logged by MainWindow in model space.
+        logger.debug(f"{sender_name}: New crop -> Width: {width}, Height: {height} at ({x}, {y})")
         self.crop_changed.emit(x, y, width, height)
     
     @Slot(float)
@@ -111,28 +113,28 @@ class PatternTwoGroupBox(QGroupBox):
         self._threshold_min = min_value
         self._threshold_max = max_value
         self.match_score_plot.set_threshold_bounds(min_value, max_value)
-    
+
     def _setup_layout(self):
         """Setup the layout with proper spacing."""
         layout = QVBoxLayout()
-        
+
         # Small margins around the container
         # layout.setContentsMargins(4, 4, 4, 4)
-        
+
         # Spacing between plots
         layout.setSpacing(10)
-        
+
         # Add plots to layout
         layout.addWidget(self.rtm_plot)
         layout.addWidget(self.mean_pixel_plot)
         layout.addWidget(self.match_score_plot)
         self.setLayout(layout)
-    
+
     @Slot(bool)
     def set_plot_visibility(self, visible: bool):
         """
         Set the visibility of all plots in the group box.
-        
+
         :param visible: Show/hide all plots.
         """
         plots = [self.rtm_plot, self.mean_pixel_plot, self.match_score_plot]

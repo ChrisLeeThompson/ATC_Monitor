@@ -22,18 +22,34 @@ logger = logging.getLogger(__name__)
 # floating-point noise to span [0, 1] and corrupt every downstream metric.
 _UNIFORM_FRAME_EPS = 1e-9
 
+# A frame whose dynamic range is carried by this many pixels or fewer is noise,
+# not signal, and must not be per-frame rescaled: rescaling would stretch 1-2
+# stray counts to full scale (observed on-tool: ONE residual count in a 7614-px
+# crop became a 255 spike, corrupting the display / mean-pixel / white-pixel
+# metrics). The faintest real features seen on-tool are ~13+ pixels (0.17%
+# coverage), well above this floor, so genuine faint signal always takes the
+# rescale path. Both guards protect the RESCALED (display/metrics) output only;
+# the fixed-scale match image (with_match_image=True) is never rescaled and
+# needs no guard.
+_SPARSE_CONTENT_PIXELS = 3
+_RAW_FULL_SCALE = 255.0
+
+# One-time-warning latch for tophat_normalized inputs exceeding full scale.
+_tophat_clip_warned = False
+
 
 # =======================
 # Core Filtering Workflow
 # =======================
 
-def filter_images(image_list, gaussian_sigma=1.0, apply_dilation=True):
+def filter_images(image_list, gaussian_sigma=1.0, apply_dilation=True,
+                  with_match_image=False):
     """
     Process a batch of images using background subtraction to isolate temporal changes.
-    
+
     This is the main filtering workflow for RTM monitoring. It removes static background
     features and highlights areas that have changed during patterning.
-    
+
     The filtering workflow:
     1. Average all images in the batch (creates background reference)
     2. Apply Gaussian blur to the average
@@ -43,15 +59,35 @@ def filter_images(image_list, gaussian_sigma=1.0, apply_dilation=True):
     6. Subtract the processed average from the processed last image
     7. Invert the result
     8. Rescale to 0.0-1.0 range
-    
-    The output is always normalized to [0.0, 1.0] so all downstream consumers
-    (pattern matching, display, thresholding, mean pixel calculation) receive
-    data in a consistent, predictable range.
 
-    :param image_list: List of 2D numpy arrays (images from RTM)
+    The output is always normalized to [0.0, 1.0] so all downstream consumers
+    (display, thresholding, mean pixel calculation) receive data in a
+    consistent, predictable range.
+
+    With ``with_match_image=True`` a SECOND image is returned for template
+    matching: the SIGNED change map (current - background, same blur/dilation
+    processing) at FIXED absolute scale, counts / _RAW_FULL_SCALE clipped to
+    [-1, 1]. Unlike the display output it is never per-frame stretched, so
+    identical scenes produce identical match images and residual noise counts
+    stay at true amplitude -- the property the matcher's raw-count calibration
+    (SIGNIFICANT_PIXEL_LEVEL / SIGNIFICANT_CHANGE_LEVEL) depends on. The sign
+    is preserved because a contrast INVERSION (a feature flipping from
+    brighter-than-background to dimmer, e.g. charging oscillation or
+    breakthrough) has an identical magnitude map and would otherwise read as
+    "no change" (adversarial review 2026-08-18). Fold it into the matcher's
+    [0, 1] domain with signed_to_match_image() AFTER cropping. The
+    uniform/sparse guards below do not apply to it: they exist to protect the
+    rescale step, and the match image has none.
+
+    :param image_list: List of 2D numpy arrays (images from RTM, raw counts)
     :param gaussian_sigma: Standard deviation for Gaussian kernel (default: 1.0)
     :param apply_dilation: Whether to apply morphological dilation (default: True)
-    :return: Filtered 2D numpy array in [0.0, 1.0] range highlighting temporal changes
+    :param with_match_image: Also return the fixed-scale signed change map
+        (default: False)
+    :return: Filtered 2D numpy array in [0.0, 1.0] range highlighting temporal
+        changes; or a tuple ``(filtered, match_image)`` when with_match_image is
+        True, where match_image is float32 in [-1.0, 1.0] at fixed absolute
+        scale (crop it, then fold with signed_to_match_image for the matcher)
     """
     if not image_list:
         raise ValueError("image_list cannot be empty")
@@ -60,6 +96,17 @@ def filter_images(image_list, gaussian_sigma=1.0, apply_dilation=True):
 
     # Create background reference by averaging all images
     background = blend_images(image_list)
+    # Pre-blur sparse-content check: how many pixels actually differ between the
+    # current frame and the batch mean, measured in RAW counts BEFORE the Gaussian
+    # smears a single stray count over ~20 px (which would defeat a count-based
+    # floor applied after filtering).
+    raw_dev = np.abs(np.asarray(last_image, dtype=float)
+                     - np.asarray(background, dtype=float))
+    raw_dev_max = float(raw_dev.max())
+    raw_content_sparse = (
+        raw_dev_max < _UNIFORM_FRAME_EPS
+        or int(np.count_nonzero(raw_dev > 0.1 * raw_dev_max)) <= _SPARSE_CONTENT_PIXELS
+    )
     background = apply_gaussian_filter(background, gaussian_sigma)
     if apply_dilation:
         background = morphological_dilation(background)
@@ -70,20 +117,63 @@ def filter_images(image_list, gaussian_sigma=1.0, apply_dilation=True):
         current = morphological_dilation(current)
 
     # Subtract background and invert to highlight changes
-    filtered_image = subtract_images(current, background)
-    filtered_image = invert_image(filtered_image)
+    diff_image = subtract_images(current, background)
+    filtered_image = invert_image(diff_image)
+
+    # Fixed-scale SIGNED match image: (current - background) in raw counts
+    # mapped by full scale, never stretched. Computed before the guards --
+    # they protect the rescale path only, and without a rescale there is
+    # nothing to amplify: 1-3 count strays stay at 1-3 counts and score ~0 in
+    # the matcher.
+    match_image = (
+        np.clip(diff_image / _RAW_FULL_SCALE, -1.0, 1.0).astype(np.float32)
+        if with_match_image else None
+    )
 
     # Guard against a near-uniform (e.g. fully-milled / blank) frame: per-frame
     # rescale_intensity below would stretch pure floating-point noise to span
     # [0, 1], producing garbage that corrupts mean-pixel / white-pixel / match
     # metrics and can trigger the multi-Otsu raise. Return a flat zero frame.
     if float(np.ptp(filtered_image)) < _UNIFORM_FRAME_EPS:
-        return np.zeros_like(filtered_image)
+        zero = np.zeros_like(filtered_image)
+        return (zero, match_image) if with_match_image else zero
+
+    # Sparse-content guard (measured pre-blur, above): a frame whose only change
+    # vs the batch mean is a couple of stray counts is noise, not signal --
+    # rescaling would promote those strays (smeared by the Gaussian) to full
+    # scale, which is what pinned the match score at the degenerate 1.0 on-tool.
+    if raw_content_sparse:
+        zero = np.zeros_like(filtered_image)
+        return (zero, match_image) if with_match_image else zero
 
     # Normalize to [0.0, 1.0] so downstream consumers get a consistent range
     filtered_image = exposure.rescale_intensity(filtered_image, out_range=(0.0, 1.0))
 
-    return filtered_image
+    return (filtered_image, match_image) if with_match_image else filtered_image
+
+
+def signed_to_match_image(signed_change_map):
+    """
+    Fold a signed fixed-scale change map ([-1, 1], from filter_images'
+    with_match_image output, cropped to the region of interest) into the
+    matcher's [0, 1] domain: positive change in the left half, negative change
+    in the right half.
+
+    Splitting by sign instead of taking |diff| preserves polarity (a contrast
+    inversion moves content between halves and reads as change) without a
+    mid-scale pedestal, which would crush TM_SQDIFF_NORMED's sensitivity
+    (score ~ n*delta^2 / (N*pedestal^2)) and defeat the sparse-tile gate.
+    Each half stays at true amplitude, so the matcher's raw-count calibration
+    holds per half.
+
+    :param signed_change_map: 2D float array in [-1.0, 1.0] at counts/255 scale
+    :return: float32 2D array in [0.0, 1.0], twice the input width
+    """
+    signed = np.asarray(signed_change_map, dtype=np.float32)
+    return np.hstack([
+        np.clip(signed, 0.0, 1.0),
+        np.clip(-signed, 0.0, 1.0),
+    ]).astype(np.float32)
 
 
 # ===============================
@@ -323,21 +413,48 @@ def tophat_display(tophat_map):
     return exposure.rescale_intensity(tophat_map, out_range=(0, 255)).astype(np.uint8)
 
 
-def tophat_normalized(tophat_map):
+def tophat_normalized(tophat_map, full_scale=_RAW_FULL_SCALE):
     """
-    Rescale a top-hat residual map to a float image in [0.0, 1.0] for template
-    matching (calculate_match_score expects [0, 1] input).
+    Map a top-hat residual map to a float image in [0.0, 1.0] for template
+    matching (calculate_match_score expects [0, 1] input), at FIXED absolute
+    scale: counts / full_scale, clipped.
 
-    Per-region rescale maximizes tile variance so the matcher does not collapse
-    foreground tiles into its near-uniform "perfect match" case. Mirrors the
-    near-uniform guard in filter_images: a fully-milled / blank region (no real
-    foreground) has no dynamic range to stretch, so return a flat zero frame
-    rather than amplifying floating-point noise to span [0, 1].
+    Fixed scale is load-bearing: identical scenes must produce identical match
+    images. The former per-frame rescale_intensity stretched whatever range each
+    frame happened to have, so on a nearly-milled crop (4-50 pixels of 1-3 count
+    residual noise -- the 2026-08-17 on-tool regime) consecutive batches became
+    independently amplified, uncorrelated noise fields and the match score hung
+    at/near 1.0 instead of settling, blocking completion. A ~3-count sparse gate
+    (2026-08-03) had already been added for the <= 3 pixel version of the same
+    amplifier; the fixed scale removes the amplifier itself.
+
+    Matching loses nothing: TM_SQDIFF_NORMED is invariant to a multiplicative
+    scaling applied to BOTH frames together (a gain change between the reference
+    and current frame is NOT cancelled -- SQDIFF_NORMED(a, k*a) = (1-k)^2/k --
+    which calculate_match_score handles separately by estimating and dividing
+    out the inter-frame gain). Confirmed by replaying the 2026-08-17 field
+    campaign, where milling-active scores are essentially unchanged while the
+    noise regimes drop to ~0. Real residual counts (measured faintest texture:
+    11-24 counts) survive above the matcher's SIGNIFICANT_PIXEL_LEVEL; noise
+    (measured ceiling: 2-4 counts, even single-frame) stays below it.
 
     :param tophat_map: output of white_tophat_map (crop it to the region first)
+    :param full_scale: detector full-scale in raw counts (255 for 8-bit; values
+        above it clip -- acceptable for a change metric, revisit for >8-bit
+        detectors together with tophat_energy's matching assumption)
     :return: float32 2D array in [0.0, 1.0]
     """
     arr = np.asarray(tophat_map, dtype=np.float32)
-    if float(np.ptp(arr)) < _UNIFORM_FRAME_EPS:
-        return np.zeros_like(arr)
-    return exposure.rescale_intensity(arr, out_range=(0.0, 1.0)).astype(np.float32)
+    peak = float(arr.max()) if arr.size else 0.0
+    if peak > float(full_scale):
+        # One-time alert: values above full scale clip to 1.0, making the
+        # matcher blind to change in clipped regions (>8-bit detector?).
+        global _tophat_clip_warned
+        if not _tophat_clip_warned:
+            _tophat_clip_warned = True
+            logger.warning(
+                "tophat_normalized: input peak %.1f exceeds full_scale %.1f - "
+                "clipping at 1.0; match scoring is blind to change in clipped "
+                "regions (is this a >8-bit detector?)", peak, float(full_scale)
+            )
+    return np.clip(arr / float(full_scale), 0.0, 1.0).astype(np.float32)

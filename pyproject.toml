@@ -1,9 +1,13 @@
 [project]
 name = "ATC Monitor"
-version = "3.3.0"
+version = "3.3.9"
 requires-python = ">=3.11"
 dependencies = [
-    "PySide6",
+    # Pinned to the validated version. Qt object-lifetime behavior is
+    # version-sensitive: the worker teardown path destroys QObjects explicitly
+    # and was validated against this exact release.
+    "PySide6==6.7.1",
+    "shiboken6==6.7.1",
     "Pillow",
     "opencv-python",
     "scikit-image",

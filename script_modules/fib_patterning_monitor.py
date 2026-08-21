@@ -45,7 +45,7 @@ try:
     logger.info("AutoScript successfully imported")
 except ImportError:
     AUTOSCRIPT_AVAILABLE = False
-    logger.warning(f"AutoScript not available", exc_info=True)
+    logger.warning("AutoScript not available", exc_info=True)
 
     # Define names to prevent NameError
     SdbMicroscopeClient = None
@@ -111,13 +111,14 @@ def _suppress_autoscript_vitality_check():
     """
     Neutralize the AutoScript client's keep-alive ("vitality check") thread.
 
-    Root cause of intermittent native crashes (Windows access violation): the
-    ORC ClientEndpoint starts a daemon thread that SENDS a keep-alive on the
-    transport socket every 250 ms. That socket (FrameSocket) is documented as
-    NOT thread-safe -- "DO NOT send/receive simultaneously from different
-    threads" -- yet these keep-alive SENDS overlap our call RECEIVES, corrupting
-    the transport and killing the whole process. It is worse when calls are slow
-    (e.g. FIB beam off), but happens with the beam on too.
+    Works around an observed transport race. The ORC ClientEndpoint starts a
+    daemon thread that sends a keep-alive on the transport socket every 250 ms.
+    That socket (FrameSocket) is documented as not thread-safe -- "DO NOT
+    send/receive simultaneously from different threads" -- so those keep-alive
+    sends can overlap our call receives. In this application that overlap
+    correlated with intermittent native faults, and suppressing the keep-alive
+    resolved them. The overlap is likelier when calls are slow (e.g. FIB beam
+    off), but is not limited to that case.
 
     We call AutoScript constantly, so a dropped connection is still detected and
     recovered on the next real call (perform_call); the proactive keep-alive is
@@ -139,8 +140,8 @@ def _suppress_autoscript_vitality_check():
                 lambda self: None)
         if not _vitality_check_suppressed:
             logger.info(
-                "AutoScript vitality-check (keep-alive) thread disabled to avoid a "
-                "non-thread-safe transport race that crashes the process"
+                "AutoScript vitality-check (keep-alive) thread disabled to avoid "
+                "overlapping sends and receives on the transport socket"
             )
             _vitality_check_suppressed = True
     except Exception:
@@ -190,7 +191,7 @@ def connect_to_microscope(host: str = "localhost") -> tuple[object | None, str]:
         _log_post_connect_state()
         return microscope, "Connected to microscope"
     except Exception:
-        logger.error(f"Failed to connect to microscope", exc_info=True)
+        logger.error("Failed to connect to microscope", exc_info=True)
         return None, "Connection failed"
 
 
@@ -209,7 +210,7 @@ def disconnect_from_microscope(microscope: object) -> str:
         logger.info("Disconnected from microscope")
         return "Disconnected from microscope"
     except Exception:
-        logger.warning(f"Error during disconnect", exc_info=True)
+        logger.warning("Error during disconnect", exc_info=True)
         return "Disconnect error"
 
 
@@ -248,7 +249,7 @@ def validate_active_device(microscope: object) -> tuple[bool | None, str]:
                 "Please select the FIB quadrant in Microscope Control."
             )
     except Exception:
-        logger.error(f"Error checking active device", exc_info=True)
+        logger.error("Error checking active device", exc_info=True)
         return None, "Device check failed"
 
 
@@ -306,7 +307,7 @@ def get_pattern_info(pattern: object) -> PatternInfo | None:
             rotation=rotation
         )
     except Exception:
-        logger.warning(f"Error extracting pattern info", exc_info=True)
+        logger.warning("Error extracting pattern info", exc_info=True)
         return None
 
 
@@ -366,7 +367,7 @@ def validate_patterns(
             return ValidationResult(
                 success=False,
                 patterns=[],
-                message=f"Unsupported pattern types detected: {', '.join(unsupported_types)}. "
+                message=f"Unsupported pattern types detected: {', '.join(unsupported_types)}"
             )
         
         # Check pattern count
@@ -392,12 +393,13 @@ def validate_patterns(
                 width_um = info.width * 1e6
                 height_um = info.height * 1e6
                 invalid_patterns.append(
-                    f"{info.pattern_id} (AR: {info.aspect_ratio})"
+                    f"{info.pattern_id} (AR: {info.aspect_ratio:.3f})"
                 )
                 logger.debug(
-                    f"Pattern {info.pattern_id} aspect ratio {info.aspect_ratio} "
-                    f"is below threshold {aspect_ratio_threshold} "
-                    f"({width_um} µm × {height_um} µm)"
+                    f"Pattern {info.pattern_id} aspect ratio "
+                    f"{info.aspect_ratio:.3f} is below threshold "
+                    f"{aspect_ratio_threshold:.2f} "
+                    f"({width_um:.2f} µm × {height_um:.2f} µm)"
                 )
         
         # If any patterns have invalid aspect ratios, return failure
@@ -405,14 +407,22 @@ def validate_patterns(
             return ValidationResult(
                 success=False,
                 patterns=pattern_infos,
-                message=f"Pattern(s) with aspect ratio < {aspect_ratio_threshold}: "
-                        f"{', '.join(invalid_patterns)}."
+                # Every number in a message that reaches the STATUS BAR must
+                # carry a format spec: the threshold arrives as a raw float
+                # from the spinbox/QSettings and renders as e.g.
+                # "0.44999999999999996" otherwise (field report 2026-08-21).
+                message=f"Pattern(s) with aspect ratio < "
+                        f"{aspect_ratio_threshold:.2f}: "
+                        f"{', '.join(invalid_patterns)}"
             )
         
         # All validation passed
         # Create summary message for return
+        # Micrometres with fixed decimals, not raw metres: raw floats render
+        # as "1.0163876069124408e-05 m" in any surface that shows this message.
         pattern_summary = ", ".join([
-            f"{info.pattern_type} ({info.width} m × {info.height} m, AR={info.aspect_ratio})"
+            f"{info.pattern_type} ({info.width * 1e6:.2f} µm × "
+            f"{info.height * 1e6:.2f} µm, AR={info.aspect_ratio:.3f})"
             for info in pattern_infos
         ])
         
@@ -423,7 +433,7 @@ def validate_patterns(
         )
         
     except Exception:
-        logger.error(f"Error during pattern validation", exc_info=True)
+        logger.error("Error during pattern validation", exc_info=True)
         return ValidationResult(
             success=False,
             patterns=[],
@@ -464,7 +474,7 @@ def setup_rtm_monitoring(microscope: object, mode: str = "HIGH_RESOLUTION") -> t
         return True, f"RTM monitoring setup complete ({mode})"
         
     except Exception:
-        logger.error(f"Error setting up RTM monitoring", exc_info=True)
+        logger.error("Error setting up RTM monitoring", exc_info=True)
         return False, "RTM setup failed"
 
 
@@ -491,7 +501,7 @@ def acquire_rtm_data(microscope: object) -> tuple[object | None, object | None, 
         return rtm_data, rtm_positions, "RTM data acquired successfully"
         
     except Exception:
-        logger.error(f"Error acquiring RTM data", exc_info=True)
+        logger.error("Error acquiring RTM data", exc_info=True)
         return None, None, "RTM data acquisition failed"
 
 
@@ -526,7 +536,7 @@ def check_patterning_state(microscope: object) -> tuple[bool | None, str]:
             return False, f"Patterning is not active (state: {state})"
 
     except Exception:
-        logger.error(f"Error checking patterning state", exc_info=True)
+        logger.error("Error checking patterning state", exc_info=True)
         return None, "State check failed"
 
 
@@ -573,7 +583,7 @@ def stop_patterning(microscope: object) -> tuple[bool, str]:
         logger.info("Patterning stopped")
         return True, "Patterning stopped"
     except Exception:
-        logger.error(f"Error stopping patterning", exc_info=True)
+        logger.error("Error stopping patterning", exc_info=True)
         return False, "Stop patterning failed"
 
 
@@ -597,7 +607,7 @@ def restart_rtm(microscope: object) -> tuple[bool, str]:
         logger.info("RTM acquisition restarted")
         return True, "RTM restarted"
     except Exception:
-        logger.error(f"Error restarting RTM", exc_info=True)
+        logger.error("Error restarting RTM", exc_info=True)
         return False, "RTM restart failed"
 
 
@@ -625,23 +635,53 @@ def read_detector_cb(microscope: object) -> tuple[float | None, float | None]:
         return None, None
 
 
-def _clamp_to_detector_limits(prop: object, value: float, lo: float, hi: float) -> float:
+def _clamp_to_detector_limits(prop: object, value: float, lo: float, hi: float,
+                              cached: tuple[float, float] | None = None) -> float:
     """
     Clamp value to [lo, hi] and, when readable, to the property's own limits.
 
     AutoScript CB properties may expose a ``.limits`` (min, max); we never write
-    outside it. If limits can't be read we fall back to the configured bounds.
+    outside it. ``cached`` supplies limits read earlier (the calibration loop
+    reads them ONCE instead of paying two SDK round-trips per write). If limits
+    can't be read we fall back to the configured bounds.
     """
     low, high = lo, hi
-    try:
-        limits = prop.limits
-        low = max(low, float(limits.min))
-        high = min(high, float(limits.max))
-    except Exception:
-        pass
+    if cached is not None:
+        low = max(low, cached[0])
+        high = min(high, cached[1])
+    else:
+        try:
+            limits = prop.limits
+            low = max(low, float(limits.min))
+            high = min(high, float(limits.max))
+        except Exception:
+            pass
     if high < low:
         high = low
     return min(high, max(low, value))
+
+
+def read_detector_cb_limits(
+    microscope: object,
+) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+    """
+    Read the detector contrast and brightness property limits once, for caching.
+
+    :return: ((c_min, c_max) | None, (b_min, b_max) | None) -- None per channel
+             when the limits are unreadable (callers fall back to live reads).
+    """
+    if not AUTOSCRIPT_AVAILABLE or microscope is None:
+        return None, None
+
+    def _limits(prop):
+        try:
+            limits = prop.limits
+            return float(limits.min), float(limits.max)
+        except Exception:
+            return None
+
+    return (_limits(microscope.detector.contrast),
+            _limits(microscope.detector.brightness))
 
 
 def set_detector_cb(
@@ -649,6 +689,7 @@ def set_detector_cb(
     contrast: float | None = None,
     brightness: float | None = None,
     bounds: tuple[float, float] = (0.0, 1.0),
+    limits: tuple[tuple[float, float] | None, tuple[float, float] | None] | None = None,
 ) -> tuple[bool, float | None, float | None, str]:
     """
     Write detector contrast and/or brightness, clamped to ``bounds`` and (when
@@ -660,21 +701,26 @@ def set_detector_cb(
     :param contrast: Desired normalized contrast in [0, 1], or None to skip
     :param brightness: Desired normalized brightness in [0, 1], or None to skip
     :param bounds: (min, max) clamp applied before the detector's own limits
+    :param limits: optional cached (contrast_limits, brightness_limits) from
+        read_detector_cb_limits, avoiding two SDK reads per write
     :return: (success, contrast_after, brightness_after, message)
     """
     if not AUTOSCRIPT_AVAILABLE or microscope is None:
         return False, None, None, "Microscope not available"
 
     lo, hi = bounds
+    c_limits, b_limits = limits if limits is not None else (None, None)
     try:
         if contrast is not None:
             c = _clamp_to_detector_limits(
-                microscope.detector.contrast, float(contrast), lo, hi
+                microscope.detector.contrast, float(contrast), lo, hi,
+                cached=c_limits
             )
             microscope.detector.contrast.value = c
         if brightness is not None:
             b = _clamp_to_detector_limits(
-                microscope.detector.brightness, float(brightness), lo, hi
+                microscope.detector.brightness, float(brightness), lo, hi,
+                cached=b_limits
             )
             microscope.detector.brightness.value = b
     except Exception:
@@ -714,7 +760,10 @@ def read_scanning_bit_depth(microscope: object) -> int | None:
         else:            # ImagingDevice.ION_BEAM (2) or unknown -> FIB default
             beam = microscope.beams.ion_beam
 
-        bits = int(beam.scanning.bit_depth.value)
+        # bit_depth is a value-object (.value) on some AutoScript builds and a
+        # plain int on others (observed on Hydra Bio) -- accept both.
+        raw = beam.scanning.bit_depth
+        bits = int(getattr(raw, "value", raw))
         return bits if bits > 0 else None
     except Exception:
         logger.warning("Failed to read scanning bit depth", exc_info=True)
