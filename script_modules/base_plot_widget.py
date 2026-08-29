@@ -14,6 +14,26 @@ from script_modules.app_styles import AppStyles
 logger = logging.getLogger(__name__)
 
 
+# Cached display presence for the draw guard. QGuiApplication.screens()
+# rebuilds a wrapper list on every call, and the guard used to run it on
+# every canvas draw -- the GUI thread's hottest native call, exercised
+# hardest during RDP screen churn (the 2026-08-25 0xc0000374 heap corruption
+# was detected inside this enumeration during a session-reset draw burst).
+# Presence only changes on screen-topology events, so enumerate only then:
+# the cache is invalidated by the screenRemoved/screenAdded/
+# primaryScreenChanged connections made in __init__, and keyed on the app
+# instance so a swapped instance (tests use fakes) re-reads. Main-thread
+# only, like every draw.
+_screens_cache_app = None      # the app instance the cache was read from
+_screens_cache_present = True  # cached bool(app.screens())
+
+
+def _invalidate_screens_cache(*_args):
+    """Force the next _screens_available() to re-enumerate."""
+    global _screens_cache_app
+    _screens_cache_app = None
+
+
 class BasePlotWidget(QWidget):
     """
     Base class for matplotlib plot widgets.
@@ -51,8 +71,13 @@ class BasePlotWidget(QWidget):
         self._setup_layout()
 
         # Auto-resume: repaint any deferred draw as soon as a display returns.
+        # screenRemoved must invalidate the presence cache, or a draw after a
+        # disconnect would trust a stale "screens present" and reach the Qt
+        # fatal the guard exists to prevent (added/primary invalidate inside
+        # _on_screens_changed).
         app = QGuiApplication.instance()
         if app is not None:
+            app.screenRemoved.connect(_invalidate_screens_cache)
             app.screenAdded.connect(self._on_screens_changed)
             app.primaryScreenChanged.connect(self._on_screens_changed)
     
@@ -94,10 +119,20 @@ class BasePlotWidget(QWidget):
 
     @staticmethod
     def _screens_available():
-        """True when at least one display is attached (a canvas draw is safe)."""
+        """True when at least one display is attached (a canvas draw is safe).
+
+        Reads the module-level cache; screens() is enumerated only when the
+        cache is invalid (first use, topology change, app instance change).
+        """
+        global _screens_cache_app, _screens_cache_present
         app = QGuiApplication.instance()
         # No application yet (shouldn't happen post-construction) -> assume safe.
-        return app is None or bool(app.screens())
+        if app is None:
+            return True
+        if app is not _screens_cache_app:
+            _screens_cache_present = bool(app.screens())
+            _screens_cache_app = app
+        return _screens_cache_present
 
     def _guarded_draw(self):
         """Screen-guarded replacement for canvas.draw (see _create_matplotlib_components)."""
@@ -129,6 +164,7 @@ class BasePlotWidget(QWidget):
 
     def _on_screens_changed(self, *args):
         """Auto-resume: repaint a deferred draw once a display is (re)connected."""
+        _invalidate_screens_cache()
         if self._redraw_pending and self._screens_available():
             self._redraw_pending = False
             self._no_screens_warned = False

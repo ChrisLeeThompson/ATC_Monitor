@@ -30,9 +30,9 @@ class BinarizationMethod(Enum):
     """
     How the foreground is isolated for the "percent pixels" completion metric.
 
-    TOP / FROZEN_MID / FROZEN_LOW freeze ONE multi-Otsu class boundary captured once
-    when monitoring begins (so the threshold doesn't drift). They differ only in WHICH
-    boundary becomes the white cutoff, i.e. how much faint mid-grey material counts as
+    TOP / FROZEN_MID / FROZEN_LOW freeze one multi-Otsu class boundary captured once
+    when monitoring begins (so the threshold doesn't drift). They differ only in which
+    boundary becomes the white cutoff, i.e. how much faint mid-gray material counts as
     white. TOPHAT_ENERGY is a different approach: a morphological white top-hat that is
     agnostic to the absolute background level (see image_processing.white_tophat_map).
     """
@@ -50,7 +50,7 @@ class ForegroundCompletionMode(Enum):
 
     ABSOLUTE_PLUS_STALL (default): ABSOLUTE, plus a grid-bar backstop. The
     criterion also passes when the foreground trace has (a) dropped to <=
-    stall_drop_fraction of its running peak AND (b) stayed flat for
+    stall_drop_fraction of its running peak and (b) stayed flat for
     stall_window consecutive rounds (windowed span on a median-smoothed series
     within max(stall_rel_tolerance * value, stall_abs_tolerance)). Exposed
     static material (e.g. a grid bar) floors the trace at a sample-dependent
@@ -123,6 +123,12 @@ class ProcessingParameters:
     # Crop areas (independent per pattern - RTM data comes separately for each)
     crop_rect_pattern_1: QRect | None = None
     crop_rect_pattern_2: QRect | None = None
+    # Image dimensions (width, height) each crop rect was captured at: the
+    # restore's fraction basis, so a saved crop lands on the same portion of
+    # a differently sized pattern (field request 2026-08-28 -- pattern sizes
+    # vary slightly between runs).
+    crop_img_size_pattern_1: tuple | None = None
+    crop_img_size_pattern_2: tuple | None = None
 
     acquisition_delay_seconds: float = 0.2                          # This is an arbitrary delay time to accommodate data processing
     percent_difference_threshold: float = 20.0                      # Percentage drop in mean pixel value to disengage delay
@@ -148,16 +154,17 @@ class ProcessingParameters:
     target_tile_size: int = 100                                     # Target tile dimension in pixels (creates ~100x100 pixel tiles)
     # Auto contrast/brightness calibration (one-shot at patterning start, then held static)
     auto_cb_on_start: bool = True                                   # On by default; runs the CB controller once when patterning starts
-    cb_white_level: float = 255.0                                   # FALLBACK full-scale; calibration auto-detects from imaging bit depth (2^bits-1) when readable
-    cb_target_median_fraction: float = 0.45                         # Desired median brightness as a fraction of full-scale
-    cb_target_contrast_span: float = 0.55                           # Desired robust occupied span (p2-p98) as a fraction of full-scale; the contrast setpoint
+    cb_recalibrate_every_session: bool = False                      # Off by default: only the first patterning session of a run calibrates (each calibration mills the live pattern for its duration); on = the pre-3.3.15 per-session behavior
+    cb_white_level: float = 255.0                                   # Fallback full-scale; calibration auto-detects from imaging bit depth (2^bits-1) when readable
+    cb_lower_margin: float = 0.15                                   # Target gap between black and the histogram's p2 edge, as a fraction of full-scale (0 = stretched to the rail)
+    cb_upper_margin: float = 0.20                                   # Target gap between the histogram's p98 edge and white, as a fraction of full-scale (larger = grayer/dimmer with more headroom)
     cb_max_white_clip_fraction: float = 0.02                        # Max acceptable fraction of pixels clipped at the ceiling (white saturation destroys the top-hat texture signal)
     cb_max_black_clip_fraction: float = 0.05                        # Max acceptable fraction of pixels clipped at the floor (black pixels are background the top-hat removes anyway)
     cb_min_bound: float = 0.0                                       # Lower clamp for normalized detector CB writes
     cb_max_bound: float = 1.0                                       # Upper clamp for normalized detector CB writes
     cb_max_iterations: int = 12                                     # Measurement budget (verify included) before locking best-so-far; loop exits early on acceptance
     cb_settle_seconds: float = 0.2                                  # Settle after each CB write before re-grabbing RTM (the RTM is no longer restarted per measurement)
-    cb_frames_per_measurement: int = 2                             # Frames pooled for ACCEPT/VERIFY measurements; search measurements always use 1 frame
+    cb_frames_per_measurement: int = 2                             # Frames pooled for accept/verify measurements; search measurements always use 1 frame
 
 
 @dataclass
@@ -267,16 +274,16 @@ class SpinBoxConstraints:
     cb_white_level_max: float = 65535.0
     cb_white_level_decimals: int = 0
     cb_white_level_single_step: float = 1.0
-    # Auto CB: target median brightness (fraction of full-scale)
-    cb_target_median_fraction_min: float = 0.05
-    cb_target_median_fraction_max: float = 0.95
-    cb_target_median_fraction_decimals: int = 2
-    cb_target_median_fraction_single_step: float = 0.05
-    # Auto CB: target contrast span (robust occupied fraction of full-scale)
-    cb_target_contrast_span_min: float = 0.20
-    cb_target_contrast_span_max: float = 0.95
-    cb_target_contrast_span_decimals: int = 2
-    cb_target_contrast_span_single_step: float = 0.05
+    # Auto CB: lower edge margin (fraction of full-scale above black)
+    cb_lower_margin_min: float = 0.0
+    cb_lower_margin_max: float = 0.45
+    cb_lower_margin_decimals: int = 2
+    cb_lower_margin_single_step: float = 0.05
+    # Auto CB: upper edge margin (fraction of full-scale below white)
+    cb_upper_margin_min: float = 0.0
+    cb_upper_margin_max: float = 0.45
+    cb_upper_margin_decimals: int = 2
+    cb_upper_margin_single_step: float = 0.05
     # Auto CB: max white clip fraction
     cb_max_white_clip_fraction_min: float = 0.0
     cb_max_white_clip_fraction_max: float = 0.8
@@ -299,7 +306,7 @@ class SpinBoxConstraints:
     cb_max_bound_single_step: float = 0.05
     # Auto CB: max controller iterations
     cb_max_iterations_min: int = 1
-    cb_max_iterations_max: int = 50
+    cb_max_iterations_max: int = 100
     cb_max_iterations_decimals: int = 0
     cb_max_iterations_single_step: int = 1
     # Auto CB: settle seconds after each CB write
@@ -332,13 +339,25 @@ class RTMParameters:
             if hasattr(self.ui, key):
                 setattr(self.ui, key, value)
     
-    def update_crop_rect_pattern_1(self, x: int, y: int, width: int, height: int):
-        """Update Pattern 1 crop rectangle."""
+    def update_crop_rect_pattern_1(self, x: int, y: int, width: int, height: int,
+                                   img_width: int | None = None,
+                                   img_height: int | None = None):
+        """Update Pattern 1 crop rectangle and, when known, the image size it
+        was captured at (the restore's fraction basis)."""
         self.processing.crop_rect_pattern_1 = QRect(x, y, width, height)
-    
-    def update_crop_rect_pattern_2(self, x: int, y: int, width: int, height: int):
-        """Update Pattern 2 crop rectangle."""
+        if img_width and img_height:
+            self.processing.crop_img_size_pattern_1 = (
+                int(img_width), int(img_height))
+
+    def update_crop_rect_pattern_2(self, x: int, y: int, width: int, height: int,
+                                   img_width: int | None = None,
+                                   img_height: int | None = None):
+        """Update Pattern 2 crop rectangle and, when known, the image size it
+        was captured at (the restore's fraction basis)."""
         self.processing.crop_rect_pattern_2 = QRect(x, y, width, height)
+        if img_width and img_height:
+            self.processing.crop_img_size_pattern_2 = (
+                int(img_width), int(img_height))
 
     # ===========================
     # QSettings Persistence
@@ -349,7 +368,7 @@ class RTMParameters:
         Save user-facing parameters to QSettings (Windows registry).
         
         Persists UI parameters (spinbox values, criteria checkboxes, options)
-        and crop rectangles. Processing parameters are NOT saved — they are
+        and crop rectangles. Processing parameters are not saved -- they are
         code-level constants set directly in the dataclass defaults.
         """
         settings = QSettings(ORGANIZATION_NAME, APPLICATION_NAME)
@@ -376,9 +395,11 @@ class RTMParameters:
         
         # --- Crop Rectangles ---
         settings.beginGroup("crop")
-        for i, rect in enumerate([
-            self.processing.crop_rect_pattern_1,
-            self.processing.crop_rect_pattern_2
+        for i, (rect, img_size) in enumerate([
+            (self.processing.crop_rect_pattern_1,
+             self.processing.crop_img_size_pattern_1),
+            (self.processing.crop_rect_pattern_2,
+             self.processing.crop_img_size_pattern_2)
         ], 1):
             if rect is not None:
                 settings.setValue(f"pattern_{i}_x", rect.x())
@@ -390,6 +411,15 @@ class RTMParameters:
                 settings.remove(f"pattern_{i}_y")
                 settings.remove(f"pattern_{i}_width")
                 settings.remove(f"pattern_{i}_height")
+            # The capture-time image size travels with the rect: without it
+            # a restore can only reuse absolute pixels, which land on the
+            # wrong portion when the next run's patterns differ in size.
+            if rect is not None and img_size is not None:
+                settings.setValue(f"pattern_{i}_img_width", img_size[0])
+                settings.setValue(f"pattern_{i}_img_height", img_size[1])
+            else:
+                settings.remove(f"pattern_{i}_img_width")
+                settings.remove(f"pattern_{i}_img_height")
         settings.endGroup()
 
         # --- Processing Parameters ---
@@ -420,9 +450,11 @@ class RTMParameters:
         settings.setValue("target_tile_size", self.processing.target_tile_size)
         # Auto contrast/brightness calibration
         settings.setValue("auto_cb_on_start", self.processing.auto_cb_on_start)
+        settings.setValue("cb_recalibrate_every_session",
+                          self.processing.cb_recalibrate_every_session)
         settings.setValue("cb_white_level", self.processing.cb_white_level)
-        settings.setValue("cb_target_median_fraction", self.processing.cb_target_median_fraction)
-        settings.setValue("cb_target_contrast_span", self.processing.cb_target_contrast_span)
+        settings.setValue("cb_lower_margin", self.processing.cb_lower_margin)
+        settings.setValue("cb_upper_margin", self.processing.cb_upper_margin)
         settings.setValue("cb_max_white_clip_fraction", self.processing.cb_max_white_clip_fraction)
         settings.setValue("cb_max_black_clip_fraction", self.processing.cb_max_black_clip_fraction)
         settings.setValue("cb_min_bound", self.processing.cb_min_bound)
@@ -442,7 +474,7 @@ class RTMParameters:
         
         Restores UI parameters (spinbox values, criteria checkboxes, options)
         and crop rectangles. Processing parameters are left as their dataclass
-        defaults — change those directly in the source code.
+        defaults -- change those directly in the source code.
         
         Falls back to defaults for any missing or invalid values.
         """
@@ -498,7 +530,12 @@ class RTMParameters:
                 w = int(settings.value(f"pattern_{i}_width"))
                 h = int(settings.value(f"pattern_{i}_height"))
                 setattr(self.processing, attr, QRect(x, y, w, h))
-        
+                if settings.contains(f"pattern_{i}_img_width"):
+                    setattr(
+                        self.processing, f"crop_img_size_pattern_{i}",
+                        (int(settings.value(f"pattern_{i}_img_width")),
+                         int(settings.value(f"pattern_{i}_img_height"))))
+
         settings.endGroup()
 
         # --- Processing Parameters ---
@@ -555,7 +592,7 @@ class RTMParameters:
             # without this one-time force, the v3.3.4 default flip to the only
             # field-validated matching path would silently never deploy on any
             # tool upgraded in place (the same trap this migration exists for).
-            # This assignment intentionally OVERRIDES the unconditional read
+            # This assignment intentionally overrides the unconditional read
             # earlier in load_settings; a value the user changes after the
             # migration is respected like any other setting.
             self.processing.match_on_foreground = (
@@ -586,16 +623,22 @@ class RTMParameters:
         # Auto contrast/brightness calibration
         self.processing.auto_cb_on_start = _bool_from_settings(
             settings.value("auto_cb_on_start", defaults_proc.auto_cb_on_start))
+        self.processing.cb_recalibrate_every_session = _bool_from_settings(
+            settings.value("cb_recalibrate_every_session",
+                           defaults_proc.cb_recalibrate_every_session))
         self.processing.cb_white_level = float(
             settings.value("cb_white_level", defaults_proc.cb_white_level))
-        self.processing.cb_target_median_fraction = float(
-            settings.value("cb_target_median_fraction", defaults_proc.cb_target_median_fraction))
-        self.processing.cb_target_contrast_span = float(
-            settings.value("cb_target_contrast_span", defaults_proc.cb_target_contrast_span))
+        # v3.3.16 edge-margin targets. The pre-3.3.16 median/span target keys
+        # are deliberately not migrated (different semantics); their stored
+        # values are simply ignored from here on.
+        self.processing.cb_lower_margin = float(
+            settings.value("cb_lower_margin", defaults_proc.cb_lower_margin))
+        self.processing.cb_upper_margin = float(
+            settings.value("cb_upper_margin", defaults_proc.cb_upper_margin))
         # One-time migration (schema v2, ATC Monitor 3.3.1): the acceptance/
         # latency retune changed these four defaults (clip 0.01/0.01 ->
         # 0.02/0.05, settle 0.5 -> 0.2, verify frames 3 -> 2). Every install
-        # that ran 3.3.0 has the OLD values persisted, and stored values win
+        # that ran 3.3.0 has the old values persisted, and stored values win
         # over dataclass defaults -- so without this the retune would silently
         # never deploy on the very tools it was built for. The version key is
         # bumped once (in save_settings); values the user changes after the

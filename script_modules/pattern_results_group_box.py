@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QGroupBox,
     QGridLayout, QSizePolicy, QCheckBox
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from script_modules.app_styles import AppStyles
 
 
@@ -20,9 +20,17 @@ logger = logging.getLogger(__name__)
 # frozen results panel used to widen the whole window permanently, because
 # the grid's minimum size tracked its largest-ever content). "(stall)"
 # renders on a second line, so the reservation is two lines tall and only
-# one value wide.
+# one value wide. "100.00" is the largest value either foreground metric can
+# show: white-pixel results are percentages, and the top-hat energy metric is
+# normalized to [0, 100] (image_processing.tophat_energy) -- an
+# unbounded metric would silently outgrow this reservation.
 _LARGEST_RESULT_TEXT = "100.00\n(stall)"      # percent-pixels row, stall-latch completion
 _WIDEST_CRITERION_TEXT = "Foreground Energy"  # criterion checkbox flips with binarization method
+
+# The grid row holding the percent-pixels results -- the only row that can
+# show the two-line stall form. Shared by the addWidget calls and the row
+# height reservation so the two cannot drift apart.
+_PERCENT_PIXELS_ROW = 3
 
 
 class PatternResultsGroupBox(QGroupBox):
@@ -97,6 +105,16 @@ class PatternResultsGroupBox(QGroupBox):
             }
         }
 
+        # Center the text inside each result label. Invisible for the normal
+        # single-line values (the label hugs its text and the grid centers the
+        # widget in its cell), but the two-line "(stall)" form is as wide as
+        # its widest line, and a left-aligned value line then sits visibly
+        # off-center above the annotation (field report 2026-08-27).
+        for labels in self._result_labels.values():
+            for label in labels.values():
+                label.setAlignment(Qt.AlignmentFlag.AlignHCenter
+                                   | Qt.AlignmentFlag.AlignVCenter)
+
         # Set checkbox styles
         for checkbox in [self.mean_slope_checkbox, self.match_score_checkbox, 
                          self.percent_pixels_checkbox]:
@@ -153,31 +171,28 @@ class PatternResultsGroupBox(QGroupBox):
         )
         grid_layout.setHorizontalSpacing(AppStyles.Dimensions.GRID_LAYOUT_HSPACING)
         grid_layout.setVerticalSpacing(AppStyles.Dimensions.GRID_LAYOUT_VSPACING)
-        # Reserve each cell's size for the largest content it can ever show,
-        # so the two-line "100.00\n(stall)" result or the "Foreground Energy"
-        # criterion label never grows the layout minimum and resizes the
-        # window mid-run. Measured on the REAL widgets -- stylesheet fonts,
-        # checkbox indicator and spacing included -- by setting the largest
-        # strings, taking the size hints, and restoring (font-metrics math
-        # under-reserved: stylesheet fonts and indicator spacing are not
-        # visible to QFontMetrics on the widget font).
-        saved_checkbox_text = self.percent_pixels_checkbox.text()
-        saved_label_text = self.p1_percent_pixels_result_label.text()
-        self.percent_pixels_checkbox.setText(_WIDEST_CRITERION_TEXT)
-        self.p1_percent_pixels_result_label.setText(_LARGEST_RESULT_TEXT)
-        grid_layout.setColumnMinimumWidth(
-            0, self.percent_pixels_checkbox.sizeHint().width() + 4)
-        largest_hint = self.p1_percent_pixels_result_label.sizeHint()
-        value_width = largest_hint.width() + 4   # widest LINE of the two
-        grid_layout.setColumnMinimumWidth(1, value_width)
-        grid_layout.setColumnMinimumWidth(2, value_width)
-        # Two-line height reservation on both percent-pixels labels: without
-        # it the row would grow downward when "(stall)" lands -- the same
-        # mid-run jump, rotated vertically.
-        self.p1_percent_pixels_result_label.setMinimumHeight(largest_hint.height())
-        self.p2_percent_pixels_result_label.setMinimumHeight(largest_hint.height())
-        self.percent_pixels_checkbox.setText(saved_checkbox_text)
-        self.p1_percent_pixels_result_label.setText(saved_label_text)
+        # Keep the handle: the reservation is re-measured whenever the
+        # measured widgets are re-metriced (see _reserve_result_extents and
+        # eventFilter), not only here at construction.
+        self._results_grid_layout = grid_layout
+        self._reserve_result_extents()
+        # Re-measure when anything re-metrics the measured widgets' text: the
+        # styles set fonts in points, so a repolish -- a stylesheet reload, or
+        # a move to a screen with a different logical DPI -- changes the pixel
+        # metrics while the reserved extents would keep the old ones, and the
+        # mid-run size jump the reservation exists to prevent would come back.
+        # The filter sits on the measured widgets, not this group box, because
+        # their stylesheets own the fonts and their events do not propagate up.
+        # The re-measure itself is deferred through this timer (see
+        # eventFilter for why); a child of the panel so a pending shot dies
+        # with it, and restarting an active timer coalesces event bursts into
+        # one re-measure.
+        self._remeasure_timer = QTimer(self)
+        self._remeasure_timer.setSingleShot(True)
+        self._remeasure_timer.setInterval(0)
+        self._remeasure_timer.timeout.connect(self._reserve_result_extents)
+        self.percent_pixels_checkbox.installEventFilter(self)
+        self.p1_percent_pixels_result_label.installEventFilter(self)
         # Add components to grid layout
         grid_layout.addWidget(self.pattern1_label, 0, 1, alignment=Qt.AlignmentFlag.AlignCenter)
         grid_layout.addWidget(self.pattern2_label, 0, 2, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -187,9 +202,9 @@ class PatternResultsGroupBox(QGroupBox):
         grid_layout.addWidget(self.match_score_checkbox, 2, 0, alignment=Qt.AlignmentFlag.AlignLeft)
         grid_layout.addWidget(self.p1_match_score_result_label, 2, 1, alignment=Qt.AlignmentFlag.AlignCenter)
         grid_layout.addWidget(self.p2_match_score_result_label, 2, 2, alignment=Qt.AlignmentFlag.AlignCenter)
-        grid_layout.addWidget(self.percent_pixels_checkbox, 3, 0, alignment=Qt.AlignmentFlag.AlignLeft)
-        grid_layout.addWidget(self.p1_percent_pixels_result_label, 3, 1, alignment=Qt.AlignmentFlag.AlignCenter)
-        grid_layout.addWidget(self.p2_percent_pixels_result_label, 3, 2, alignment=Qt.AlignmentFlag.AlignCenter)
+        grid_layout.addWidget(self.percent_pixels_checkbox, _PERCENT_PIXELS_ROW, 0, alignment=Qt.AlignmentFlag.AlignLeft)
+        grid_layout.addWidget(self.p1_percent_pixels_result_label, _PERCENT_PIXELS_ROW, 1, alignment=Qt.AlignmentFlag.AlignCenter)
+        grid_layout.addWidget(self.p2_percent_pixels_result_label, _PERCENT_PIXELS_ROW, 2, alignment=Qt.AlignmentFlag.AlignCenter)
         grid_layout.addWidget(self.confirmation_rounds_label, 4, 0, alignment=Qt.AlignmentFlag.AlignLeft)
         grid_layout.addWidget(self.p1_confirmation_rounds_result_label, 4, 1, alignment=Qt.AlignmentFlag.AlignCenter)
         grid_layout.addWidget(self.p2_confirmation_rounds_result_label, 4, 2, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -198,8 +213,76 @@ class PatternResultsGroupBox(QGroupBox):
         grid_layout.addWidget(self.p2_pattern_duration_result_label, 5, 2, alignment=Qt.AlignmentFlag.AlignCenter)
         # Add grid layout to main layout
         main_layout.addLayout(grid_layout)
-        
+
         return main_layout
+
+    def _reserve_result_extents(self):
+        """Reserve each cell's size for the largest content it can ever show,
+        so the two-line "100.00\\n(stall)" result or the "Foreground Energy"
+        criterion label never grows the layout minimum and resizes the window
+        mid-run. Measured on the real widgets -- stylesheet fonts, checkbox
+        indicator and spacing included -- by setting the largest strings,
+        taking the size hints, and restoring (font-metrics math
+        under-reserved: stylesheet fonts and indicator spacing are not
+        visible to QFontMetrics on the widget font)."""
+        grid_layout = self._results_grid_layout
+        saved_checkbox_text = self.percent_pixels_checkbox.text()
+        saved_label_text = self.p1_percent_pixels_result_label.text()
+        self.percent_pixels_checkbox.setText(_WIDEST_CRITERION_TEXT)
+        self.p1_percent_pixels_result_label.setText(_LARGEST_RESULT_TEXT)
+        # The columns carry 4 px of slack against hint rounding; the height
+        # takes the hint verbatim -- a rounded-down width would clip text,
+        # while a height off by a pixel only shifts the row's centering.
+        grid_layout.setColumnMinimumWidth(
+            0, self.percent_pixels_checkbox.sizeHint().width() + 4)
+        largest_hint = self.p1_percent_pixels_result_label.sizeHint()
+        value_width = largest_hint.width() + 4   # widest line of the two
+        grid_layout.setColumnMinimumWidth(1, value_width)
+        grid_layout.setColumnMinimumWidth(2, value_width)
+        # Two-line height reservation on the percent-pixels row, not on the
+        # labels themselves. Either one stops the row growing downward when
+        # "(stall)" lands -- the same mid-run jump, rotated vertically -- but
+        # reserving it on the labels stretched their styled background to two
+        # lines permanently, so the result chip sat conspicuously tall while
+        # showing a single line. Reserving the row keeps the layout minimum
+        # fixed while each label still sizes to its own content; the
+        # AlignCenter on the addWidget calls then centers the short form in
+        # the taller row.
+        grid_layout.setRowMinimumHeight(_PERCENT_PIXELS_ROW, largest_hint.height())
+        self.percent_pixels_checkbox.setText(saved_checkbox_text)
+        self.p1_percent_pixels_result_label.setText(saved_label_text)
+
+    def eventFilter(self, watched, event):
+        """Schedule a reservation re-measure when a measured widget is
+        re-metriced.
+
+        The measurement must not run here, synchronously: Qt delivers
+        FontChange from inside the stylesheet style's polish, where that
+        style's recursion guard is held and sizeHint() falls back to the
+        base style's metrics (smaller font, no stylesheet indicator rules).
+        Measuring at that moment reserved column 0 too narrow and clipped
+        "Foreground Energy" on-tool (field report 2026-08-25). Deferring to
+        the next event-loop pass measures with the final styled metrics,
+        coalesces event bursts into one re-measure, and removes any
+        re-entrancy concern.
+        """
+        if (event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange)
+                and getattr(self, "_remeasure_timer", None) is not None):
+            self._remeasure_timer.start()
+        return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _apply_result_style(label, style):
+        """Restyle a result label only when the sheet actually changes.
+
+        Qt repolishes on every setStyleSheet call, identical string or not,
+        and a repolish of a filtered label re-fires the reservation
+        re-measure -- once per results round for the life of a run. The
+        match/default style flips rarely; the unchanged rounds should cost
+        nothing.
+        """
+        if label.styleSheet() != style:
+            label.setStyleSheet(style)
 
     # ===========================
     # Public API
@@ -260,10 +343,9 @@ class PatternResultsGroupBox(QGroupBox):
     def set_mean_slope_result_match(self, is_match: bool, pattern_idx: int = 0):
         """Set the mean slope result label style based on whether it's a match."""
         label = self._get_label('mean_slope', pattern_idx)
-        if is_match:
-            label.setStyleSheet(AppStyles.Label.result_match())
-        else:
-            label.setStyleSheet(AppStyles.Label.result_default())
+        self._apply_result_style(
+            label, AppStyles.Label.result_match() if is_match
+            else AppStyles.Label.result_default())
 
     # ===========================
     # Match Score
@@ -278,10 +360,9 @@ class PatternResultsGroupBox(QGroupBox):
     def set_match_score_result_match(self, is_match: bool, pattern_idx: int = 0):
         """Set the match score result label style based on whether it's a match."""
         label = self._get_label('match_score', pattern_idx)
-        if is_match:
-            label.setStyleSheet(AppStyles.Label.result_match())
-        else:
-            label.setStyleSheet(AppStyles.Label.result_default())
+        self._apply_result_style(
+            label, AppStyles.Label.result_match() if is_match
+            else AppStyles.Label.result_default())
 
     # ===========================
     # Percent Pixels
@@ -309,10 +390,9 @@ class PatternResultsGroupBox(QGroupBox):
     def set_percent_pixels_result_match(self, is_match: bool, pattern_idx: int = 0):
         """Set the percent pixels result label style based on whether it's a match."""
         label = self._get_label('percent_pixels', pattern_idx)
-        if is_match:
-            label.setStyleSheet(AppStyles.Label.result_match())
-        else:
-            label.setStyleSheet(AppStyles.Label.result_default())
+        self._apply_result_style(
+            label, AppStyles.Label.result_match() if is_match
+            else AppStyles.Label.result_default())
 
     # ===========================
     # Confirmation Rounds
@@ -341,10 +421,9 @@ class PatternResultsGroupBox(QGroupBox):
     def set_confirmation_rounds_result_match(self, is_match: bool, pattern_idx: int = 0):
         """Set the confirmation rounds result label style based on whether it's a match."""
         label = self._get_label('confirmation_rounds', pattern_idx)
-        if is_match:
-            label.setStyleSheet(AppStyles.Label.result_match())
-        else:
-            label.setStyleSheet(AppStyles.Label.result_default())
+        self._apply_result_style(
+            label, AppStyles.Label.result_match() if is_match
+            else AppStyles.Label.result_default())
 
     # ===========================
     # Duration
@@ -366,7 +445,7 @@ class PatternResultsGroupBox(QGroupBox):
         for idx in indices:
             label = self._get_label('duration', idx)
             label.setText("")
-            label.setStyleSheet(AppStyles.Label.result_default())
+            self._apply_result_style(label, AppStyles.Label.result_default())
 
     # ===========================
     # Bulk Operations
@@ -383,4 +462,4 @@ class PatternResultsGroupBox(QGroupBox):
             for key in self._result_labels[idx]:
                 label = self._result_labels[idx][key]
                 label.setText("")
-                label.setStyleSheet(AppStyles.Label.result_default())
+                self._apply_result_style(label, AppStyles.Label.result_default())

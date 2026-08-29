@@ -15,6 +15,13 @@ logger = logging.getLogger(__name__)
 
 
 _OPPOSITE = {"top": "bottom", "bottom": "top", "left": "right", "right": "left"}
+
+# Minimum gap between the crop rectangle and every image edge, as a fraction
+# of each image dimension (field request 2026-08-28): a crop flush against
+# the border is hard to see and hard to grab, and the analysis rarely wants
+# border pixels. Enforced by every placement path and by edge dragging; at
+# least one original pixel per side, so it survives the smallest RTM images.
+_CROP_EDGE_GAP_FRAC = 0.02
 _ROTATION_SIGN = +1  # display handedness; only matters for non-0/180 rotations
 
 
@@ -134,6 +141,11 @@ class InteractiveCropRectangle:
         self.active_edge = None
         self.press_data = None
         self.hovering_edge = None
+
+        # Drag bounds in display coordinates (x_min, x_max, y_min, y_max,
+        # visual-top y space), set by the owning widget to keep the crop a
+        # small gap off every image edge; None falls back to the axes limits.
+        self.drag_bounds = None
         
         # Colors
         self.edge_color_normal = "#04f5ff"
@@ -168,8 +180,9 @@ class InteractiveCropRectangle:
         """
         Check if mouse position is near any corner or edge.
         Corners take priority over edges.
-        Returns: 'top_left', 'top_right', 'bottom_left', 'bottom_right',
-                 'left', 'right', 'top', 'bottom', or None
+
+        :return: 'top_left', 'top_right', 'bottom_left', 'bottom_right',
+            'left', 'right', 'top', 'bottom', or None
         """
         if x is None or y is None:
             return None
@@ -195,7 +208,7 @@ class InteractiveCropRectangle:
         dist_top = abs(y - rect_y)
         dist_bottom = abs(y - (rect_y + height))
         
-        # Check for corners FIRST (corners take priority)
+        # Check for corners first (corners take priority)
         # Top-left corner
         if dist_left < threshold_x and dist_top < threshold_y:
             return 'top_left'
@@ -406,12 +419,19 @@ class InteractiveCropRectangle:
         elif self.active_edge == 'bottom':
             new_height = max(min_size, orig_height + dy)
         
-        # Constrain to axes bounds
-        xlim = self.ax.get_xlim()
-        ylim = self.ax.get_ylim()
-        
-        new_x = max(xlim[0], min(new_x, xlim[1] - new_width))
-        new_y = max(ylim[1], min(new_y, ylim[0] - new_height))
+        # Constrain to the widget-provided drag bounds (the crop-to-border
+        # gap), else the raw axes bounds. Sizes are capped first so a fast
+        # outward drag cannot push the far edge past the boundary.
+        if self.drag_bounds is not None:
+            bx0, bx1, by0, by1 = self.drag_bounds
+        else:
+            xlim = self.ax.get_xlim()
+            ylim = self.ax.get_ylim()
+            bx0, bx1, by0, by1 = xlim[0], xlim[1], ylim[1], ylim[0]
+        new_width = min(new_width, bx1 - bx0)
+        new_height = min(new_height, by1 - by0)
+        new_x = max(bx0, min(new_x, bx1 - new_width))
+        new_y = max(by0, min(new_y, by1 - new_height))
         
         # Update rectangle
         self.rect.set_xy((new_x, new_y))
@@ -533,7 +553,7 @@ class RTMPlotWidget(BasePlotWidget):
         # rotates the on-screen scan direction before choosing the bold edge.
         self._scan_rotation = 0.0
         
-        # Store current image dimensions in ORIGINAL pixel space
+        # Store current image dimensions in original pixel space
         # (used for worker communication and crop coordinate conversion)
         self.image_width = default_size
         self.image_height = default_size
@@ -549,6 +569,10 @@ class RTMPlotWidget(BasePlotWidget):
         # Saved crop rectangle from previous session (original pixel space)
         # If set, used instead of 85% default on first image
         self._saved_crop_rect = None  # (x, y, width, height) or None
+
+        # A cross-launch restore is waiting for the first real image. Both
+        # set_saved_crop_* methods raise it; every placement path clears it.
+        self._restore_pending = False
         
         # Cached imshow artist for set_data() fast path
         self._imshow_artist = None
@@ -565,7 +589,7 @@ class RTMPlotWidget(BasePlotWidget):
         self.ax.clear()
         self._style_axes(self.ax)
         
-        # Set limits based on display dimensions (original × scale)
+        # Set limits based on display dimensions (original * scale)
         display_w = self.image_width * self._display_scale
         display_h = self.image_height * self._display_scale
         self.ax.set_xlim(0, display_w)
@@ -673,9 +697,16 @@ class RTMPlotWidget(BasePlotWidget):
             self.canvas.draw()
         
         elif self._imshow_artist is not None:
-            # Fast path — same dimensions, just swap the image data
+            # Fast path -- same dimensions, just swap the image data
             self._imshow_artist.set_data(display_image)
-            self._imshow_artist.autoscale()  
+            self._imshow_artist.autoscale()
+            # The title must follow the view: toggling Show RTM Images
+            # mid-run swaps the displayed image on this path, and only the
+            # full-redraw branches used to set the title -- the right image
+            # sat under the wrong title until a dimension change.
+            if self.ax.get_title() != title:
+                self.ax.set_title(
+                    title, fontsize=AppStyles.Dimensions.PLOT_TITLE_FONT_SIZE)
             self.canvas.draw_idle()
         
         else:
@@ -695,13 +726,35 @@ class RTMPlotWidget(BasePlotWidget):
             self.ax.set_xticks([])
             self.ax.set_yticks([])
             
-            # Re-add existing crop patch (and its emphasis overlay) or create default
-            if self.interactive_crop:
-                self.interactive_crop.readd_to_axes()
+            # Re-add existing crop patch (and its emphasis overlay), create
+            # the default -- or consume a pending cross-launch restore. A
+            # restore normally lands via the dimension-change branch above,
+            # but a first image that happens to match the construction
+            # placeholder's size takes this branch, and re-adding the
+            # construction-time default would leave the restored crop
+            # silently waiting for a resize.
+            if self._restore_pending or self.interactive_crop is None:
+                self._scale_crop_to_new_dimensions()
             else:
-                self._add_default_crop_rectangle()
+                self.interactive_crop.readd_to_axes()
             self.canvas.draw()
     
+    def has_received_image(self) -> bool:
+        """True once a real RTM frame has been displayed.
+
+        Before the first frame the widget shows only the construction-time
+        placeholder geometry; a crop read in that state describes nothing
+        the operator chose. On 2026-08-28 an app opened and closed without
+        ever receiving a frame saved the placeholder crop over the
+        operator's real one -- the persistence sync must skip widgets in
+        this state."""
+        return self._imshow_artist is not None
+
+    def _edge_gaps(self):
+        """Per-axis crop-to-border gap in original pixels (at least 1)."""
+        return (max(1, round(self.image_width * _CROP_EDGE_GAP_FRAC)),
+                max(1, round(self.image_height * _CROP_EDGE_GAP_FRAC)))
+
     def set_saved_crop_rect(self, x: int, y: int, width: int, height: int):
         """
         Set a saved crop rectangle from a previous session.
@@ -715,6 +768,38 @@ class RTMPlotWidget(BasePlotWidget):
         :param height: Height in pixels
         """
         self._saved_crop_rect = (x, y, width, height)
+        # Drop the construction-time default so the first real image consumes
+        # the saved rect. Without this the restore was dead code: __init__
+        # seeds _relative_crop from the 512x512 placeholder before any saved
+        # rect can arrive, and every placement path prefers _relative_crop --
+        # so the 85% default silently replaced the operator's saved crop on
+        # every launch (found 2026-08-27 while pinning the short-image clamp).
+        self._relative_crop = None
+        self._restore_pending = True
+
+    def set_saved_crop_fractions(self, x_frac: float, y_frac: float,
+                                 w_frac: float, h_frac: float):
+        """
+        Restore a saved crop as fractions of the image (the preferred form).
+
+        Fractions land the crop on the same portion of the pattern whatever
+        size the next run's images are (pattern sizes vary slightly between
+        runs -- field request 2026-08-28), where the absolute form could only
+        be clamped. The first real image routes these through
+        _scale_crop_to_new_dimensions, which applies the minimum-size caps,
+        clamps into bounds, and emits crop_changed so the worker's crop
+        agrees with the drawn box from the first frame.
+
+        :param x_frac: Left edge as a fraction of image width (0-1)
+        :param y_frac: Top edge as a fraction of image height (0-1)
+        :param w_frac: Width as a fraction of image width (0-1)
+        :param h_frac: Height as a fraction of image height (0-1)
+        """
+        clamp = lambda v: min(1.0, max(0.0, float(v)))
+        self._relative_crop = (clamp(x_frac), clamp(y_frac),
+                               clamp(w_frac), clamp(h_frac))
+        self._saved_crop_rect = None
+        self._restore_pending = True
 
     def _add_default_crop_rectangle(self):
         """
@@ -723,26 +808,39 @@ class RTMPlotWidget(BasePlotWidget):
         Uses saved crop from previous session if available (clamped to current
         image bounds). Otherwise creates an 85% centered default.
         """
+        self._restore_pending = False
+        # The 20 px minimum crop must never exceed the image itself: a wide
+        # pattern only a few pixels tall (field screenshot, 2026-08-27) got a
+        # 20-tall crop pinned at y=0 that overflowed the displayed image, and
+        # the stored relative height went above 1.0 and propagated. The
+        # minimum is measured against the interior between the edge gaps.
+        gx, gy = self._edge_gaps()
+        min_w = max(1, min(20, self.image_width - 2 * gx))
+        min_h = max(1, min(20, self.image_height - 2 * gy))
         if self._saved_crop_rect is not None:
             sx, sy, sw, sh = self._saved_crop_rect
-            # Clamp to current image dimensions
-            crop_x = max(0, min(sx, self.image_width - 20))
-            crop_y = max(0, min(sy, self.image_height - 20))
-            crop_width = max(20, min(sw, self.image_width - crop_x))
-            crop_height = max(20, min(sh, self.image_height - crop_y))
+            # Clamp to the current image's interior (inside the edge gaps)
+            crop_x = max(gx, min(sx, self.image_width - gx - min_w))
+            crop_y = max(gy, min(sy, self.image_height - gy - min_h))
+            crop_width = max(min_w, min(sw, self.image_width - gx - crop_x))
+            crop_height = max(min_h, min(sh, self.image_height - gy - crop_y))
             # Clear so it's only used once (subsequent resets use relative_crop)
             self._saved_crop_rect = None
-            logger.debug(
+            # INFO, not debug: the 2026-08-28 restore analysis had to infer
+            # which placement path ran from a missing log line.
+            logger.info(
                 f"Restoring saved crop rectangle: x={crop_x}, y={crop_y}, "
                 f"width={crop_width}, height={crop_height}"
             )
         else:
-            # Default crop: 85% of image size, centered
-            crop_width = max(20, int(self.image_width * 0.85))
-            crop_height = max(20, int(self.image_height * 0.85))
-            crop_x = (self.image_width - crop_width) // 2
-            crop_y = (self.image_height - crop_height) // 2
-            logger.debug(
+            # Default crop: 85% of image size, centered (inside the gaps)
+            crop_width = max(min_w, min(int(self.image_width * 0.85),
+                                        self.image_width - 2 * gx))
+            crop_height = max(min_h, min(int(self.image_height * 0.85),
+                                         self.image_height - 2 * gy))
+            crop_x = max(gx, (self.image_width - crop_width) // 2)
+            crop_y = max(gy, (self.image_height - crop_height) // 2)
+            logger.info(
                 f"Creating default crop rectangle: x={crop_x}, y={crop_y}, "
                 f"width={crop_width}, height={crop_height} (display scale: {self._display_scale}x)"
             )
@@ -764,8 +862,14 @@ class RTMPlotWidget(BasePlotWidget):
             'width': crop_width * s,
             'height': crop_height * s
         }
-        
+
         self.add_crop_rectangle(crop_params)
+        # Tell the worker. This was the one placement path that never
+        # emitted: a restored crop left the worker running the raw persisted
+        # rect while the GUI drew the clamped one, un-reconciled until the
+        # first drag (2026-08-28 morning log). The construction-time emit
+        # precedes every connection and is harmless.
+        self.crop_changed.emit(crop_x, crop_y, crop_width, crop_height)
     
     def _scale_crop_to_new_dimensions(self):
         """
@@ -776,22 +880,34 @@ class RTMPlotWidget(BasePlotWidget):
         and emits crop_changed in original space so the worker receives
         correct values.
         """
+        self._restore_pending = False
         if self._relative_crop is None:
             self._add_default_crop_rectangle()
             return
         
         x_frac, y_frac, w_frac, h_frac = self._relative_crop
-        
-        # Convert relative fractions to original pixel coordinates
-        min_size = 20
-        x = int(x_frac * self.image_width)
-        y = int(y_frac * self.image_height)
-        width = max(min_size, int(w_frac * self.image_width))
-        height = max(min_size, int(h_frac * self.image_height))
-        
-        # Constrain to image bounds (original space)
-        x = max(0, min(x, self.image_width - width))
-        y = max(0, min(y, self.image_height - height))
+
+        # Convert relative fractions to original pixel coordinates. The
+        # minimum is capped at the image dimension (see
+        # _add_default_crop_rectangle): a short image must not receive a
+        # crop taller than itself.
+        # round(), not int(): truncation shaved a pixel per rescale, a slow
+        # drift on runs whose image dimensions change often (the fractions
+        # stay the source of truth either way). Sizes and positions are
+        # bounded by the interior between the edge gaps.
+        gx, gy = self._edge_gaps()
+        x = round(x_frac * self.image_width)
+        y = round(y_frac * self.image_height)
+        width = max(max(1, min(20, self.image_width - 2 * gx)),
+                    min(round(w_frac * self.image_width),
+                        self.image_width - 2 * gx))
+        height = max(max(1, min(20, self.image_height - 2 * gy)),
+                     min(round(h_frac * self.image_height),
+                         self.image_height - 2 * gy))
+
+        # Constrain to the image interior (original space)
+        x = max(gx, min(x, self.image_width - gx - width))
+        y = max(gy, min(y, self.image_height - gy - height))
         
         logger.info(
             f"Crop scaled to new dimensions: ({x}, {y}) {width}x{height} "
@@ -816,7 +932,7 @@ class RTMPlotWidget(BasePlotWidget):
         """
         Add crop rectangle to the plot.
         
-        :param rect_params: Dicitonary with 'x', 'y', 'width', 'height' to define the crop rectangle.
+        :param rect_params: Dictionary with 'x', 'y', 'width', 'height' to define the crop rectangle.
         :param interactive: If True, creates an interactive rectangle that can be dragged. If False, creates a static rectangle.
         """
         # Remove old rectangle if exists
@@ -833,6 +949,14 @@ class RTMPlotWidget(BasePlotWidget):
                 rect_params,
                 on_change_callback=self._on_crop_changed,
                 emphasis_edges=_scan_direction_to_edges(self._scan_direction, self._scan_rotation)
+            )
+            # Dragging keeps the crop a small gap off every image edge,
+            # matching the gap every placement path enforces.
+            gx, gy = self._edge_gaps()
+            s = self._display_scale
+            self.interactive_crop.drag_bounds = (
+                gx * s, (self.image_width - gx) * s,
+                gy * s, (self.image_height - gy) * s,
             )
         else:
             # Create static rectangle

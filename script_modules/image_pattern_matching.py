@@ -9,8 +9,8 @@ tiled template matching to detect how much the pattern has changed.
 Matching is performed using OpenCV's TM_SQDIFF_NORMED method, which normalizes
 the squared difference by the two patches' energy (geometric mean of their sums
 of squares), yielding scores in [0.0, 1.0]. That normalization cancels a
-multiplicative scaling applied to BOTH patches together; a gain change BETWEEN
-the reference and current frame is NOT cancelled (SQDIFF_NORMED(a, k*a) =
+multiplicative scaling applied to both patches together; a gain change between
+the reference and current frame is not canceled (SQDIFF_NORMED(a, k*a) =
 (1-k)^2/k), so a uniform inter-frame gain is estimated and divided out before
 scoring (see estimate_interframe_gain; the caller decides -- a one-off step is
 a CB/detector event, consecutive same-pattern corrections are refused as real
@@ -34,17 +34,17 @@ logger = logging.getLogger(__name__)
 
 
 # A uint8 pixel above this level (~4% of full scale) counts as "significant"
-# signal. Inputs arrive at TRUE amplitude (raw counts / 255, fixed scale --
+# signal. Inputs arrive at true amplitude (raw counts / 255, fixed scale --
 # tophat_normalized on the foreground path, filter_images' with_match_image
 # output on the grayscale path), so this gates on physical residual counts. Measured
 # on the 2026-08-17 field campaign: noise ceiling 2-4 counts (even on single
 # frames); faintest real residual texture 11-24 counts. 10 sits between those
-# bands. This level ONLY routes a tile (absolute-scale vs cv2 scoring); it does
+# bands. This level only routes a tile (absolute-scale vs cv2 scoring); it does
 # not decide whether a tile changed -- that is SIGNIFICANT_CHANGE_LEVEL below,
 # which is what keeps a dim-but-real scene from reading as settled.
 SIGNIFICANT_PIXEL_LEVEL = 10
 
-# A tile with this many significant pixels or fewer on EITHER side is "sparse":
+# A tile with this many significant pixels or fewer on either side is "sparse":
 # TM_SQDIFF_NORMED's energy normalization is degenerate there (a blank or
 # near-blank patch makes OpenCV clamp the result to exactly 1.0 -- the on-tool
 # stuck-at-1.0 failure, where one relocated stray pixel pinned the score all
@@ -54,7 +54,7 @@ SIGNIFICANT_PIXEL_LEVEL = 10
 # safely between.
 SPARSE_TILE_PIXELS = 3
 
-# A pixel whose absolute frame-to-frame DIFFERENCE exceeds this level (raw
+# A pixel whose absolute frame-to-frame difference exceeds this level (raw
 # counts) counts as genuinely changed. Sparse tiles are scored by counting
 # these, not by summing their energy and not by their absolute brightness:
 # scoring on brightness alone made any change dimmer than SIGNIFICANT_PIXEL_LEVEL
@@ -64,11 +64,11 @@ SPARSE_TILE_PIXELS = 3
 # same crop at 12 counts scored 1.0).
 # Measured separation on the 2026-08-17 campaign (consecutive-batch top-hat
 # crops, worst case single frames rather than batch means): milled-through tails
-# that MUST settle peak at |diff| = 1-3 counts with ZERO pixels above 4, while
+# that must settle peak at |diff| = 1-3 counts with zero pixels above 4, while
 # active milling shows |diff| up to 70-95 counts with 460-1230 pixels above 4.
 # 4 sits in that gap with an order of magnitude of margin on both sides. Tuning
-# LOWER admits noise (score hangs high; completion blocked -- safe but annoying);
-# HIGHER hides real change (declares complete early -- the dangerous direction).
+# lower admits noise (score hangs high; completion blocked -- safe but annoying);
+# higher hides real change (declares complete early -- the dangerous direction).
 SIGNIFICANT_CHANGE_LEVEL = 4
 
 # Normalizer for sparse tiles: the count of significantly-changed pixels is
@@ -89,13 +89,13 @@ SPARSE_ASYM_NORM_PIXELS = 64
 MIN_IMAGE_DIMENSION = 5
 
 # Inter-frame gain normalization. TM_SQDIFF_NORMED does not cancel a gain
-# change BETWEEN frames: SQDIFF_NORMED(a, k*a) = (1-k)^2/k, so a >=~25% CB /
+# change between frames: SQDIFF_NORMED(a, k*a) = (1-k)^2/k, so a >=~25% CB /
 # beam-current / detector step between consecutive batches scores above the
 # completion threshold on settled dense tiles (resetting confirmations) and can
 # trip the delay-phase match transition before milling starts. When the current
 # frame is a uniform multiple of the reference over the jointly-significant
 # pixels, that gain is divided out before scoring. The gates below make the
-# estimator refuse anything that is not gain-like, so REAL change (a milling
+# estimator refuse anything that is not gain-like, so real change (a milling
 # front, which is spatially heterogeneous and moves content across the
 # significance level) is never normalized away:
 GAIN_NORM_MIN_PIXELS = 16     # fewer jointly-significant px: tiles are sparse-
@@ -175,7 +175,7 @@ def calculate_match_score(first_image, last_image, min_splits=3, target_tile_siz
        sides; change-count scoring for sparse tiles (below)
     5. Return the maximum match score across all tiles
 
-    Input images are expected in [0.0, 1.0] range at FIXED absolute scale
+    Input images are expected in [0.0, 1.0] range at fixed absolute scale
     (counts / 255: tophat_normalized output on the foreground path,
     filter_images' with_match_image output on the grayscale path), so the
     conversion to uint8 restores raw counts without any contrast stretching.
@@ -183,7 +183,7 @@ def calculate_match_score(first_image, last_image, min_splits=3, target_tile_siz
     TM_SQDIFF_NORMED normalizes by patch energy (geometric mean of the two patches'
     sums of squares), producing values in [0.0, 1.0]. 0.0 = perfect match, 1.0 =
     maximum difference. The normalization cancels a scaling applied to both frames
-    together only; a uniform gain change BETWEEN the frames is estimated and
+    together only; a uniform gain change between the frames is estimated and
     divided out before scoring (never when the change is heterogeneous, i.e. real
     -- see estimate_interframe_gain). A tile whose TM_SQDIFF_NORMED value
     saturates at >= 1.0 (structurally possible at low cosine similarity; OpenCV
@@ -198,7 +198,7 @@ def calculate_match_score(first_image, last_image, min_splits=3, target_tile_siz
     difference forever. Such tiles are detected by counting significant pixels and
     scored on absolute scale instead: the count of pixels whose frame-to-frame
     difference exceeds SIGNIFICANT_CHANGE_LEVEL, over SPARSE_ASYM_NORM_PIXELS. That
-    measure is independent of how BRIGHT the content is, so a genuine appearance /
+    measure is independent of how bright the content is, so a genuine appearance /
     disappearance stays decisive even in a dim regime, while stray-count churn
     (which changes nothing by more than a count or two) scores ~0.
 
@@ -210,14 +210,14 @@ def calculate_match_score(first_image, last_image, min_splits=3, target_tile_siz
     :param log_tag: Optional prefix (e.g. "Pattern 1: ") for log attribution
     :param interframe_gain: Caller-supplied uniform gain of last_image relative
         to first_image (from estimate_interframe_gain), divided out before
-        scoring; None = no correction. The DECISION to correct lives with the
+        scoring; None = no correction. The decision to correct lives with the
         caller because it needs cross-batch state: a genuine CB/detector step
         is a one-off event, while a sustained same-direction "gain" on
-        consecutive batches is real uniform milling change that must NOT be
+        consecutive batches is real uniform milling change that must not be
         normalized away (the worker refuses consecutive corrections)
     :return: Match score as float (0.0 = perfect match, 1.0 = maximum difference),
         or None when no score can be computed (shape mismatch / image too small /
-        no valid tiles). Callers must treat None as "score unavailable", NEVER as a
+        no valid tiles). Callers must treat None as "score unavailable", never as a
         match -- a 0.0 here would satisfy the completion criterion and could stop
         milling early on a broken input.
     """
@@ -239,7 +239,7 @@ def calculate_match_score(first_image, last_image, min_splits=3, target_tile_siz
         return None
 
     # Inter-frame gain normalization (caller-decided; see the param docstring).
-    # Applied by scaling the BRIGHTER side down -- never up -- so no value can
+    # Applied by scaling the brighter side down -- never up -- so no value can
     # exceed full scale: dividing the current frame by k < 1 would inflate
     # near-full-scale pixels past 1.0 and the necessary clip would erase real
     # change against the ceiling (TM_SQDIFF_NORMED is identical either way).
@@ -293,7 +293,7 @@ def calculate_match_score(first_image, last_image, min_splits=3, target_tile_siz
             sig_last = int(np.count_nonzero(last_tile > SIGNIFICANT_PIXEL_LEVEL))
             sig_first = int(np.count_nonzero(first_tile > SIGNIFICANT_PIXEL_LEVEL))
             if sig_last <= SPARSE_TILE_PIXELS or sig_first <= SPARSE_TILE_PIXELS:
-                # Score by COUNTING significantly-changed pixels against a fixed
+                # Score by counting significantly-changed pixels against a fixed
                 # feature-scale area. This is the same measure whether the tile
                 # is empty on both sides (stray-pixel churn -> 0 changed -> ~0)
                 # or content appeared/disappeared on one side, so a real event
@@ -320,13 +320,13 @@ def calculate_match_score(first_image, last_image, min_splits=3, target_tile_siz
                     # r + 1/r - 2*rho (>= 1.0 whenever cosine similarity rho is
                     # low enough), and OpenCV clamps it to exactly 1.0 --
                     # discarding all magnitude. Substitute the module's own
-                    # change-count measure so the tail stays graded, FLOORED at
+                    # change-count measure so the tail stays graded, floored at
                     # the smallest count field evidence covers: every one of
                     # the 465 saturated tiles in the 2026-08-17 campaign had
                     # >= 6 changed px (honest score >= 0.094 = ~2x threshold).
                     # A saturated dense tile provably had a large relative
                     # energy change, so a tiny count (e.g. a compact 4-px
-                    # cluster vanishing) must not map BELOW threshold -- the
+                    # cluster vanishing) must not map below threshold -- the
                     # floor keeps such an event blocking for the one batch it
                     # is visible, exactly as the pre-demotion clamp did, while
                     # every field-observed tile's score is unchanged.

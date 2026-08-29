@@ -4,7 +4,6 @@ Pattern match score plot widget.
 import matplotlib
 matplotlib.set_loglevel("WARNING")  # Suppress matplotlib debug messages
 import logging
-import numpy as np
 from matplotlib.ticker import MaxNLocator
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QCursor
@@ -63,9 +62,6 @@ class PatternMatchPlotWidget(BasePlotWidget):
         self.canvas.mpl_connect("button_press_event", self._on_match_score_threshold_press)
         self.canvas.mpl_connect("button_release_event", self._on_match_score_threshold_release)
         self.canvas.mpl_connect("motion_notify_event", self._on_match_score_threshold_motion)
-
-        # Plot test data for design purposes
-        # self._plot_test_data()
 
         # Draw
         self.canvas.draw()
@@ -185,18 +181,6 @@ class PatternMatchPlotWidget(BasePlotWidget):
         """Get the current threshold value."""
         return self._threshold_value
     
-    def _plot_test_data(self):
-        """Plot test data for design purposes."""
-        # Generate test data - simulate pattern match scores over frames
-        frames = np.arange(0, 100)
-        # Create realistic-looking match scores with some variation
-        base_score = 0.5
-        noise = np.random.normal(0, 0.05, len(frames))
-        drift = np.sin(frames / 20) * 0.1  # Slow drift
-        match_scores = base_score + noise + drift
-        
-        self.plot_data(frames, match_scores)
-
     def plot_data(self, x_data, y_data):
         """
         Plot pattern match score data.

@@ -24,11 +24,11 @@ _UNIFORM_FRAME_EPS = 1e-9
 
 # A frame whose dynamic range is carried by this many pixels or fewer is noise,
 # not signal, and must not be per-frame rescaled: rescaling would stretch 1-2
-# stray counts to full scale (observed on-tool: ONE residual count in a 7614-px
+# stray counts to full scale (observed on-tool: one residual count in a 7614-px
 # crop became a 255 spike, corrupting the display / mean-pixel / white-pixel
 # metrics). The faintest real features seen on-tool are ~13+ pixels (0.17%
 # coverage), well above this floor, so genuine faint signal always takes the
-# rescale path. Both guards protect the RESCALED (display/metrics) output only;
+# rescale path. Both guards protect the rescaled (display/metrics) output only;
 # the fixed-scale match image (with_match_image=True) is never rescaled and
 # needs no guard.
 _SPARSE_CONTENT_PIXELS = 3
@@ -64,18 +64,18 @@ def filter_images(image_list, gaussian_sigma=1.0, apply_dilation=True,
     (display, thresholding, mean pixel calculation) receive data in a
     consistent, predictable range.
 
-    With ``with_match_image=True`` a SECOND image is returned for template
-    matching: the SIGNED change map (current - background, same blur/dilation
-    processing) at FIXED absolute scale, counts / _RAW_FULL_SCALE clipped to
+    With ``with_match_image=True`` a second image is returned for template
+    matching: the signed change map (current - background, same blur/dilation
+    processing) at fixed absolute scale, counts / _RAW_FULL_SCALE clipped to
     [-1, 1]. Unlike the display output it is never per-frame stretched, so
     identical scenes produce identical match images and residual noise counts
     stay at true amplitude -- the property the matcher's raw-count calibration
     (SIGNIFICANT_PIXEL_LEVEL / SIGNIFICANT_CHANGE_LEVEL) depends on. The sign
-    is preserved because a contrast INVERSION (a feature flipping from
+    is preserved because a contrast inversion (a feature flipping from
     brighter-than-background to dimmer, e.g. charging oscillation or
     breakthrough) has an identical magnitude map and would otherwise read as
     "no change" (adversarial review 2026-08-18). Fold it into the matcher's
-    [0, 1] domain with signed_to_match_image() AFTER cropping. The
+    [0, 1] domain with signed_to_match_image() after cropping. The
     uniform/sparse guards below do not apply to it: they exist to protect the
     rescale step, and the match image has none.
 
@@ -97,7 +97,7 @@ def filter_images(image_list, gaussian_sigma=1.0, apply_dilation=True,
     # Create background reference by averaging all images
     background = blend_images(image_list)
     # Pre-blur sparse-content check: how many pixels actually differ between the
-    # current frame and the batch mean, measured in RAW counts BEFORE the Gaussian
+    # current frame and the batch mean, measured in raw counts before the Gaussian
     # smears a single stray count over ~20 px (which would defeat a count-based
     # floor applied after filtering).
     raw_dev = np.abs(np.asarray(last_image, dtype=float)
@@ -120,7 +120,7 @@ def filter_images(image_list, gaussian_sigma=1.0, apply_dilation=True,
     diff_image = subtract_images(current, background)
     filtered_image = invert_image(diff_image)
 
-    # Fixed-scale SIGNED match image: (current - background) in raw counts
+    # Fixed-scale signed match image: (current - background) in raw counts
     # mapped by full scale, never stretched. Computed before the guards --
     # they protect the rescale path only, and without a rescale there is
     # nothing to amplify: 1-3 count strays stay at 1-3 counts and score ~0 in
@@ -305,7 +305,7 @@ def frozen_threshold_for_boundary(image, num_classes, boundary_index):
     chooses how inclusive the binary is:
 
     - ``-1`` : boundary of the brightest class only (most selective; original behavior)
-    - ``0``  : lowest boundary (most inclusive; keeps faint mid-grey features)
+    - ``0``  : lowest boundary (most inclusive; keeps faint mid-gray features)
     - middle : a balance between the two
 
     The index is clamped into range so a degenerate (near-uniform) frame, where the
@@ -370,10 +370,10 @@ def threshold_adaptive(image, delay_active, mean_pixel_at_delay=None):
 # =======================
 #
 # A morphological white top-hat estimates the local background by an opening with a
-# disk structuring element and subtracts it, so only bright features SMALLER than the
+# disk structuring element and subtracts it, so only bright features smaller than the
 # disk survive. This isolates the bright, sharply-textured foreground regardless of the
 # absolute background level or slowly-varying static detail (e.g. a grid bar), which a
-# single global threshold cannot do. Used as a CONTINUOUS energy metric (mean residual)
+# single global threshold cannot do. Used as a continuous energy metric (mean residual)
 # rather than a binary count, so it has no threshold to freeze or drift.
 
 
@@ -382,9 +382,9 @@ def white_tophat_map(image, radius=5):
     White top-hat foreground map: bright, sharply-textured features survive; the local
     and slowly-varying static background is removed.
 
-    Compute this on the FULL (uncropped) frame so the disk has real surrounding context
+    Compute this on the full (uncropped) frame so the disk has real surrounding context
     and there is no crop-boundary artifact in the local-background estimate; crop the
-    RESULT afterwards if a region-scoped metric is wanted.
+    result afterwards if a region-scoped metric is wanted.
 
     :param image: 2D numpy array (raw detector counts)
     :param radius: disk structuring-element radius = the maximum foreground feature scale
@@ -416,7 +416,7 @@ def tophat_display(tophat_map):
 def tophat_normalized(tophat_map, full_scale=_RAW_FULL_SCALE):
     """
     Map a top-hat residual map to a float image in [0.0, 1.0] for template
-    matching (calculate_match_score expects [0, 1] input), at FIXED absolute
+    matching (calculate_match_score expects [0, 1] input), at fixed absolute
     scale: counts / full_scale, clipped.
 
     Fixed scale is load-bearing: identical scenes must produce identical match
@@ -429,8 +429,8 @@ def tophat_normalized(tophat_map, full_scale=_RAW_FULL_SCALE):
     amplifier; the fixed scale removes the amplifier itself.
 
     Matching loses nothing: TM_SQDIFF_NORMED is invariant to a multiplicative
-    scaling applied to BOTH frames together (a gain change between the reference
-    and current frame is NOT cancelled -- SQDIFF_NORMED(a, k*a) = (1-k)^2/k --
+    scaling applied to both frames together (a gain change between the reference
+    and current frame is not canceled -- SQDIFF_NORMED(a, k*a) = (1-k)^2/k --
     which calculate_match_score handles separately by estimating and dividing
     out the inter-frame gain). Confirmed by replaying the 2026-08-17 field
     campaign, where milling-active scores are essentially unchanged while the

@@ -5,11 +5,11 @@ This module handles evaluation of RTM image processing results to determine
 when FIB milling patterns have reached completion.
 
 The monitoring workflow has three phases:
-1. DELAY - Initial phase while the pattern starts milling (delay_active=True)
-2. MONITORING - Active evaluation against thresholds (delay_active=False)
-3. COMPLETE - Pattern has met all criteria for required confirmation rounds
+1. Delay - initial phase while the pattern starts milling (delay_active=True)
+2. Monitoring - active evaluation against thresholds (delay_active=False)
+3. Complete - the pattern has met all criteria for required confirmation rounds
 
-During DELAY phase, no criteria checking occurs. Once delay is deactivated,
+During the delay phase, no criteria checking occurs. Once delay is deactivated,
 the module evaluates up to four criteria each round (only those enabled via
 checkboxes in the Pattern Results group box):
 - Mean pixel slope: Rate of brightness change (should be near zero when milling completes)
@@ -56,7 +56,7 @@ class StallConfig:
     stall_rel_tolerance: float = 0.10  # relative flatness tolerance (fraction of current value)
     stall_abs_tolerance: float = 0.15  # absolute flatness tolerance (foreground units)
     smoothing_points: int = 3          # trailing-median smoothing width (current value / flat window)
-    baseline_smoothing_points: int = 5  # trailing-median width for the running PEAK: wider than
+    baseline_smoothing_points: int = 5  # trailing-median width for the running peak: wider than
                                         # smoothing_points so a <=2-batch transient (e.g. a charging
                                         # flash) cannot inflate the peak and fake the drop condition
                                         # (adversarial review 2026-08-18: a 2-batch >=2.86x flash
@@ -68,7 +68,7 @@ class StallResult:
     """
     Outcome of one stall evaluation over the foreground history.
 
-    ``latched`` is the AND of ``dropped`` and ``flat``; the components and the
+    ``latched`` is the logical "and" of ``dropped`` and ``flat``; the components and the
     intermediate values are surfaced for logging, metrics persistence, and the
     GUI arming-level overlay.
     """
@@ -88,9 +88,9 @@ def evaluate_foreground_stall(
     Evaluate the grid-bar stall latch over a pattern's foreground history.
 
     The latch detects "the trace has floored": it requires the median-smoothed
-    trace to have BOTH dropped to <= stall_drop_fraction of its running peak
+    trace to have both dropped to <= stall_drop_fraction of its running peak
     (so a mid-run plateau near the peak -- active milling pausing -- can never
-    latch) AND stayed flat across the last stall_window rounds (windowed span
+    latch) and stayed flat across the last stall_window rounds (windowed span
     within max(stall_rel_tolerance * value, stall_abs_tolerance) -- so a
     slowly-decaying tail keeps milling until it truly levels out). Smoothing is
     a trailing median so single-cycle spikes neither break a genuine flat
@@ -115,7 +115,7 @@ def evaluate_foreground_stall(
     ]
     smoothed = smoothed_series[-1]
 
-    # The running peak uses a WIDER trailing median than the flat window: a
+    # The running peak uses a wider trailing median than the flat window: a
     # transient shorter than half of baseline_smoothing_points (e.g. a 2-batch
     # charging flash) must not inflate the peak, or the drop test would read
     # the trace's ordinary level as "dropped" and the latch could fire on a
@@ -230,7 +230,7 @@ class EvaluationState:
 
     # Flags
     all_criteria_met: bool = False       # Whether current round meets all criteria
-    # True when ANY round of the current confirmation streak passed the
+    # True when any round of the current confirmation streak passed the
     # foreground criterion via the stall latch. pixels_via alone reflects only
     # the latest round; a streak can mix ABS and STALL rounds (raw value
     # straddling the threshold while the smoothed latch holds), and a
@@ -286,7 +286,7 @@ class CriteriaResult:
     """
     Per-criterion pass/fail breakdown for one evaluation round.
 
-    ``all_met`` is the AND of the three booleans and is what drives the
+    ``all_met`` is the logical "and" of the three booleans and is what drives the
     confirmation counter; the individual booleans are surfaced to the GUI so the
     green/red indicators reflect exactly the same decision (including enabled-flag
     auto-pass and the foreground completion mode).
@@ -408,7 +408,7 @@ def check_completion_criteria(
 
     :param mean_pixel_slope: Current slope (absolute value)
     :param match_score: Current match score, or None when unavailable this round.
-        None FAILS the (enabled) match criterion -- an unavailable score must
+        None fails the (enabled) match criterion -- an unavailable score must
         never read as a match, or a broken input could stop milling early.
     :param white_pixels_percentage: Current white pixel / foreground-energy value
     :param criteria: Threshold values and enabled flags
@@ -417,7 +417,7 @@ def check_completion_criteria(
     :param log_tag: Optional prefix (e.g. "Pattern 1: ") for log attribution
     :return: CriteriaResult with slope_ok/match_ok/pixels_ok/pixels_via (and .all_met)
     """
-    # Each criterion: enabled → check threshold, disabled → auto-pass (True)
+    # Each criterion: enabled -> check threshold, disabled -> auto-pass (True)
     slope_ok = (abs(mean_pixel_slope) <= criteria.mean_pixel_slope_threshold
                 if criteria.mean_slope_enabled else True)
 
@@ -425,7 +425,7 @@ def check_completion_criteria(
                  and match_score <= criteria.match_score_threshold)
                 if criteria.match_score_enabled else True)
 
-    # Foreground criterion: absolute level, optionally OR'd with the grid-bar
+    # Foreground criterion: absolute level, optionally or'd with the grid-bar
     # stall latch (ABSOLUTE_PLUS_STALL). The stall path exists because exposed
     # static material (e.g. a grid bar) floors the trace at a sample-dependent
     # non-zero level that the absolute threshold cannot be tuned to sit above
@@ -485,10 +485,10 @@ def check_all_patterns_complete(pattern_states: list[EvaluationState]) -> bool:
     Check if all patterns have reached completion.
     
     This is used to determine when to stop patterning. Patterning should only
-    stop when ALL active patterns are complete.
-    
+    stop when all active patterns are complete.
+
     For single pattern monitoring: returns True when that pattern is complete
-    For dual pattern monitoring: returns True only when BOTH patterns are complete
+    For dual pattern monitoring: returns True only when both patterns are complete
     
     :param pattern_states: List of EvaluationState objects for all active patterns
     :return: True if all patterns are complete, False otherwise

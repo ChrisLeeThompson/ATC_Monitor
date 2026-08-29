@@ -4,28 +4,32 @@ Main-thread responsiveness watchdog (v3.3.7).
 The 2026-08-19 evening crashes were GUI hangs: the main thread stopped
 processing posted events within ~10 ms of a Start click while the worker
 thread stayed healthy, and Windows eventually terminated the ghosted app
-(TerminateProcess) -- which leaves NO faulthandler dump and NO WER minidump.
+(TerminateProcess) -- which leaves no faulthandler dump and no WER minidump.
 The only instrument that can attribute this failure class is one that
-captures the stack DURING the hang. That is this watchdog:
+captures the stack during the hang. That is this watchdog:
 
 - The GUI thread beats a timestamp once per second (QTimer -> beat()).
 - A daemon thread polls the timestamp; if the beat goes stale past the
-  stall threshold it writes "WATCHDOG ... unresponsive" plus a FULL
+  stall threshold it writes "WATCHDOG ... unresponsive" plus a full
   all-thread traceback (faulthandler.dump_traceback) through the same
   kept-open crash file faulthandler is armed on -- once per stall episode,
   re-arming if the GUI recovers.
 
-Known blind spot (documented, accepted): a main thread hung while HOLDING
-the GIL would also starve this pure-Python watchdog thread. The observed
-incidents had the GIL circulating (the logging thread kept writing), so
-this design captures them. If a dump ever fails to appear during a
-confirmed hang, the GIL-free fallback is a re-armed
-faulthandler.dump_traceback_later.
+Known blind spot: a main thread hung while holding the GIL also starves
+this pure-Python watchdog thread. The observed incidents had the GIL
+circulating (the logging thread kept writing), so this design captures
+them; the GIL-holding class is covered separately by the
+faulthandler.dump_traceback_later fallback re-armed from the GUI heartbeat
+(atc_monitor._on_watchdog_heartbeat, since v3.3.12) -- it dumps from a C
+thread that needs no GIL.
 
 Suspend guard: time.monotonic() on Windows includes time spent suspended,
 so a laptop sleep (or a whole-process freeze) would fake a stall. If the
 poll loop itself skipped far more than one interval, the whole process was
-frozen -- re-baseline and skip instead of dumping.
+frozen -- re-baseline and skip instead of dumping. The skip is logged: the
+same gap signature also appears when this thread was starved by a
+GIL-holding main-thread stall, and a silent re-baseline would hide that
+episode entirely (the dump_traceback_later fallback captures its stack).
 
 Every write path is guarded: the watchdog must never raise and never take
 the app down.
@@ -107,6 +111,11 @@ class GuiWatchdog:
             self._last_check = now
             if gap > self._poll * _SUSPEND_GUARD_FACTOR:
                 self._last_beat = now
+                self._write(
+                    f"WATCHDOG {time.strftime('%H:%M:%S')} poll gap "
+                    f"{gap:.1f}s - re-baselined (system suspend, or this "
+                    f"thread was starved by a GIL-holding stall)\n"
+                )
                 return
 
             age = now - self._last_beat

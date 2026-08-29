@@ -4,6 +4,7 @@ Settings Dialog
 This module contains the implementation of the settings modal dialog for the ATC Monitor application.
 """
 import logging
+from dataclasses import fields
 from pathlib import Path
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout,
@@ -27,7 +28,7 @@ from script_modules.spinbox_widgets import (
     LinearRegressionFitPoints, AspectRatioThreshold, MinimumNumberOfImageRegionSplits,
     TargetImageRegionTileSize, StallWindow, StallDropFraction,
     StallRelTolerance, StallAbsTolerance,
-    CBWhiteLevel, CBTargetMedianFraction, CBTargetContrastSpan,
+    CBWhiteLevel, CBLowerMargin, CBUpperMargin,
     CBMaxWhiteClipFraction, CBMaxBlackClipFraction, CBMinBound, CBMaxBound,
     CBMaxIterations, CBSettleSeconds, CBFramesPerMeasurement
 )
@@ -38,9 +39,48 @@ logger = logging.getLogger(__name__)
 
 class SettingsDialog(QDialog):
 
-    def __init__(self, parent=None, constraints: SpinBoxConstraints | None = None, 
-                 processing_params: ProcessingParameters | None = None):
+    #: ProcessingParameters fields that may be edited while monitoring is
+    #: running. The one-shot edge-margin correction is their only reader, once
+    #: per patterning session: the margins, clip limits and bounds when it
+    #: builds its CBEdgeConfig; the measurement budget, settle time and frame
+    #: count as its loop runs; and auto_cb_on_start at the correction trigger,
+    #: which reads it after the parameter queue drains (see _arm_cb_calibration
+    #: -- read at the arming point instead, a mid-run enable was a silent
+    #: no-op). So a change cannot disturb anything in flight, and takes effect
+    #: at the next correction.
+    #:
+    #: Most of the other settings in this dialog are read per batch, so changing
+    #: one mid-run would splice two incompatible scales into a single metric
+    #: series that the completion criteria then read as continuous. A few are
+    #: not (acquisition_delay_seconds is a per-iteration sleep;
+    #: aspect_ratio_threshold is read once per session at pattern validation) and
+    #: stay locked anyway -- the audit that produced this list only cleared the
+    #: CB group, and widening it is a decision to make deliberately, per
+    #: parameter, not a gap to close by pattern-matching on read cadence.
+    LIVE_EDITABLE_FIELDS = (
+        "auto_cb_on_start",
+        "cb_recalibrate_every_session",
+        "cb_white_level",
+        "cb_lower_margin",
+        "cb_upper_margin",
+        "cb_max_white_clip_fraction",
+        "cb_max_black_clip_fraction",
+        "cb_min_bound",
+        "cb_max_bound",
+        "cb_max_iterations",
+        "cb_settle_seconds",
+        "cb_frames_per_measurement",
+    )
+
+    def __init__(self, parent=None, constraints: SpinBoxConstraints | None = None,
+                 processing_params: ProcessingParameters | None = None,
+                 monitoring_active: bool = False):
         super().__init__(parent)
+        # While monitoring runs the dialog opens read-only except for the
+        # Contrast/Brightness Calibration group (see LIVE_EDITABLE_FIELDS). The
+        # operator can still see every current value, which they could not when
+        # the whole dialog was locked behind a disabled button.
+        self._monitoring_active = bool(monitoring_active)
         # Dialog title and width
         self.setWindowTitle(AppStyles.AppText.SETTINGS_DIALOG_TITLE)
         self.setMinimumWidth(AppStyles.Dimensions.SETTINGS_DIALOG_WIDTH)
@@ -64,6 +104,7 @@ class SettingsDialog(QDialog):
         self._create_components()
         self._setup_layout()
         self._setup_connections()
+        self._apply_monitoring_lock()
     
     def _create_components(self):
         ## Monitoring group
@@ -199,20 +240,26 @@ class SettingsDialog(QDialog):
         self.auto_cb_on_start_checkbox = QCheckBox()
         self.auto_cb_on_start_checkbox.setStyleSheet(AppStyles.CheckBox.settings_dialog())
         self.auto_cb_on_start_checkbox.setChecked(self._initial.auto_cb_on_start)
+        # Calibration cadence: first patterning session only (default) vs
+        # every session
+        self.cb_recalibrate_every_session_checkbox = QCheckBox()
+        self.cb_recalibrate_every_session_checkbox.setStyleSheet(AppStyles.CheckBox.settings_dialog())
+        self.cb_recalibrate_every_session_checkbox.setChecked(
+            self._initial.cb_recalibrate_every_session)
         # Detector full-scale / saturation ceiling
         self.cb_white_level_spinbox = CBWhiteLevel(
             parent=self, constraints=self._constraints,
             initial_value=self._initial.cb_white_level
         )
-        # Target median brightness (fraction of full-scale)
-        self.cb_target_median_fraction_spinbox = CBTargetMedianFraction(
+        # Lower edge margin: gap between black and the histogram's p2 edge
+        self.cb_lower_margin_spinbox = CBLowerMargin(
             parent=self, constraints=self._constraints,
-            initial_value=self._initial.cb_target_median_fraction
+            initial_value=self._initial.cb_lower_margin
         )
-        # Target contrast span (robust occupied fraction of full-scale)
-        self.cb_target_contrast_span_spinbox = CBTargetContrastSpan(
+        # Upper edge margin: gap between the histogram's p98 edge and white
+        self.cb_upper_margin_spinbox = CBUpperMargin(
             parent=self, constraints=self._constraints,
-            initial_value=self._initial.cb_target_contrast_span
+            initial_value=self._initial.cb_upper_margin
         )
         # Max white clip fraction
         self.cb_max_white_clip_fraction_spinbox = CBMaxWhiteClipFraction(
@@ -316,16 +363,17 @@ class SettingsDialog(QDialog):
         cb_group_box.setStyleSheet(AppStyles.GroupBox.settings())
         cb_grid_layout = QGridLayout()
         self._add_row_to_grid_layout(cb_grid_layout, 0, "Auto-Calibrate on Start", self.auto_cb_on_start_checkbox, tooltip=AppStyles.AppToolTips.CB_AUTO_ON_START_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 1, "Detector White Level (fallback)", self.cb_white_level_spinbox, tooltip=AppStyles.AppToolTips.CB_WHITE_LEVEL_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 2, "Target Median (fraction)", self.cb_target_median_fraction_spinbox, tooltip=AppStyles.AppToolTips.CB_TARGET_MEDIAN_FRACTION_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 3, "Target Contrast Span (fraction)", self.cb_target_contrast_span_spinbox, tooltip=AppStyles.AppToolTips.CB_TARGET_CONTRAST_SPAN_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 4, "Max White Clip (fraction)", self.cb_max_white_clip_fraction_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_WHITE_CLIP_FRACTION_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 5, "Max Black Clip (fraction)", self.cb_max_black_clip_fraction_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_BLACK_CLIP_FRACTION_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 6, "C/B Lower Bound", self.cb_min_bound_spinbox, tooltip=AppStyles.AppToolTips.CB_MIN_BOUND_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 7, "C/B Upper Bound", self.cb_max_bound_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_BOUND_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 8, "Max Iterations", self.cb_max_iterations_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_ITERATIONS_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 9, "Settle Time (s)", self.cb_settle_seconds_spinbox, tooltip=AppStyles.AppToolTips.CB_SETTLE_SECONDS_LABEL)
-        self._add_row_to_grid_layout(cb_grid_layout, 10, "Verify Frames", self.cb_frames_per_measurement_spinbox, tooltip=AppStyles.AppToolTips.CB_FRAMES_PER_MEASUREMENT_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 1, "Recalibrate Every Session", self.cb_recalibrate_every_session_checkbox, tooltip=AppStyles.AppToolTips.CB_RECALIBRATE_EVERY_SESSION_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 2, "Detector White Level (fallback)", self.cb_white_level_spinbox, tooltip=AppStyles.AppToolTips.CB_WHITE_LEVEL_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 3, "Lower Margin (fraction)", self.cb_lower_margin_spinbox, tooltip=AppStyles.AppToolTips.CB_LOWER_MARGIN_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 4, "Upper Margin (fraction)", self.cb_upper_margin_spinbox, tooltip=AppStyles.AppToolTips.CB_UPPER_MARGIN_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 5, "Max White Clip (fraction)", self.cb_max_white_clip_fraction_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_WHITE_CLIP_FRACTION_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 6, "Max Black Clip (fraction)", self.cb_max_black_clip_fraction_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_BLACK_CLIP_FRACTION_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 7, "C/B Lower Bound", self.cb_min_bound_spinbox, tooltip=AppStyles.AppToolTips.CB_MIN_BOUND_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 8, "C/B Upper Bound", self.cb_max_bound_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_BOUND_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 9, "Max Iterations", self.cb_max_iterations_spinbox, tooltip=AppStyles.AppToolTips.CB_MAX_ITERATIONS_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 10, "Settle Time (s)", self.cb_settle_seconds_spinbox, tooltip=AppStyles.AppToolTips.CB_SETTLE_SECONDS_LABEL)
+        self._add_row_to_grid_layout(cb_grid_layout, 11, "Verify Frames", self.cb_frames_per_measurement_spinbox, tooltip=AppStyles.AppToolTips.CB_FRAMES_PER_MEASUREMENT_LABEL)
         cb_group_box.setLayout(cb_grid_layout)
         # Buttons layout
         buttons_layout = QHBoxLayout()
@@ -343,6 +391,17 @@ class SettingsDialog(QDialog):
         content_layout.addWidget(image_analysis_group_box)
         content_layout.addWidget(pattern_matching_group_box)
         content_layout.addWidget(cb_group_box)
+        # Kept for _apply_monitoring_lock: everything except the CB group stays
+        # locked while monitoring runs (see LIVE_EDITABLE_FIELDS for why).
+        self._locked_while_monitoring = (
+            monitoring_group_box, image_processing_group_box,
+            image_analysis_group_box, pattern_matching_group_box,
+        )
+        # Kept because the lock is structural (group boxes) while the live push
+        # is by name (LIVE_EDITABLE_FIELDS): the two agree only as long as this
+        # group holds exactly the live-editable widgets, and the test suite
+        # pins that through this handle.
+        self._cb_group_box = cb_group_box
         content_layout.addStretch()
 
         content_widget = QWidget()
@@ -361,7 +420,7 @@ class SettingsDialog(QDialog):
         self.setLayout(main_layout)
         self.ensurePolished()  # apply stylesheet fonts so size hints are accurate
 
-        # Width: fit the content's natural width PLUS the scrollbar gutter so the
+        # Width: fit the content's natural width plus the scrollbar gutter so the
         # group boxes are never clipped on the right by the scrollbar.
         scrollbar_width = scroll_area.verticalScrollBar().sizeHint().width()
         content_width = content_widget.sizeHint().width()
@@ -386,6 +445,10 @@ class SettingsDialog(QDialog):
         label.setStyleSheet(AppStyles.Label.settings())
         if tooltip:
             label.setToolTip(tooltip)
+            # The input widget carries the same tooltip: the operator hovers
+            # the control at least as often as its label, and until 3.4.2
+            # that hover showed nothing.
+            widget.setToolTip(tooltip)
         grid.setHorizontalSpacing(AppStyles.Dimensions.GRID_LAYOUT_HSPACING)
         grid.setVerticalSpacing(AppStyles.Dimensions.GRID_LAYOUT_VSPACING)
         grid.setContentsMargins(
@@ -468,9 +531,11 @@ class SettingsDialog(QDialog):
         self.target_image_region_tile_size_spinbox.setValue(self._defaults.target_tile_size)
         # Contrast/Brightness calibration
         self.auto_cb_on_start_checkbox.setChecked(self._defaults.auto_cb_on_start)
+        self.cb_recalibrate_every_session_checkbox.setChecked(
+            self._defaults.cb_recalibrate_every_session)
         self.cb_white_level_spinbox.setValue(self._defaults.cb_white_level)
-        self.cb_target_median_fraction_spinbox.setValue(self._defaults.cb_target_median_fraction)
-        self.cb_target_contrast_span_spinbox.setValue(self._defaults.cb_target_contrast_span)
+        self.cb_lower_margin_spinbox.setValue(self._defaults.cb_lower_margin)
+        self.cb_upper_margin_spinbox.setValue(self._defaults.cb_upper_margin)
         self.cb_max_white_clip_fraction_spinbox.setValue(self._defaults.cb_max_white_clip_fraction)
         self.cb_max_black_clip_fraction_spinbox.setValue(self._defaults.cb_max_black_clip_fraction)
         self.cb_min_bound_spinbox.setValue(self._defaults.cb_min_bound)
@@ -480,6 +545,45 @@ class SettingsDialog(QDialog):
         self.cb_frames_per_measurement_spinbox.setValue(self._defaults.cb_frames_per_measurement)
         logger.info("Settings dialog: restored defaults")
     
+    def _apply_monitoring_lock(self):
+        """
+        Disable everything that cannot safely change mid-run.
+
+        No tooltip: a control grayed out during a run reads as exactly that.
+
+        Restore Defaults is disabled too, and that is not cosmetic. It writes
+        every field at once, including the locked ones. Those values would be
+        saved and would replace the main window's ProcessingParameters while the
+        running worker kept its own copy -- so the worker and the saved settings
+        would silently disagree, and the next Start would come up on defaults the
+        operator never chose. (The on-tool settings are deliberately not the
+        shipped defaults: span 0.70 against a 0.55 default, among others.)
+        """
+        if not self._monitoring_active:
+            return
+        for group_box in self._locked_while_monitoring:
+            group_box.setEnabled(False)
+        self.restore_defaults_button.setEnabled(False)
+
+    def live_editable_changes(self, updated: ProcessingParameters) -> dict:
+        """
+        The LIVE_EDITABLE_FIELDS whose values differ from the ones this dialog
+        opened with.
+
+        Diffed on accept rather than tracked per keystroke on purpose: a spin box
+        emits valueChanged on every step, so wiring these to the signal would
+        queue an update per scroll tick of a drag.
+
+        :param updated: the ProcessingParameters collected from the dialog
+        :return: {field_name: new_value} -- empty when nothing changed
+        """
+        changed = {}
+        for name in self.LIVE_EDITABLE_FIELDS:
+            new_value = getattr(updated, name)
+            if new_value != getattr(self._initial, name):
+                changed[name] = new_value
+        return changed
+
     def get_parameters(self) -> ProcessingParameters:
         """Collect current settings from the dialog and return as a ProcessingParameters object."""
         params = ProcessingParameters(
@@ -505,9 +609,11 @@ class SettingsDialog(QDialog):
             min_pattern_splits=int(self.minimum_number_of_image_region_splits_spinbox.value()),
             target_tile_size=int(self.target_image_region_tile_size_spinbox.value()),
             auto_cb_on_start=self.auto_cb_on_start_checkbox.isChecked(),
+            cb_recalibrate_every_session=(
+                self.cb_recalibrate_every_session_checkbox.isChecked()),
             cb_white_level=self.cb_white_level_spinbox.value(),
-            cb_target_median_fraction=self.cb_target_median_fraction_spinbox.value(),
-            cb_target_contrast_span=self.cb_target_contrast_span_spinbox.value(),
+            cb_lower_margin=self.cb_lower_margin_spinbox.value(),
+            cb_upper_margin=self.cb_upper_margin_spinbox.value(),
             cb_max_white_clip_fraction=self.cb_max_white_clip_fraction_spinbox.value(),
             cb_max_black_clip_fraction=self.cb_max_black_clip_fraction_spinbox.value(),
             cb_min_bound=self.cb_min_bound_spinbox.value(),
@@ -516,5 +622,18 @@ class SettingsDialog(QDialog):
             cb_settle_seconds=self.cb_settle_seconds_spinbox.value(),
             cb_frames_per_measurement=int(self.cb_frames_per_measurement_spinbox.value())
         )
+        if self._monitoring_active:
+            # A locked widget can still change the value it reports: a spin box
+            # rounds to its declared decimals, so a QSettings binary round-trip
+            # like aspect_ratio_threshold = 0.44999999999999996 comes back as
+            # 0.45. Accepting the dialog mid-run would then silently rewrite a
+            # locked field while the running worker keeps the original -- the
+            # exact worker/settings divergence the monitoring lock exists to
+            # prevent. Locked fields pass through exactly as the dialog opened
+            # with them.
+            for dc_field in fields(params):
+                if dc_field.name not in self.LIVE_EDITABLE_FIELDS:
+                    setattr(params, dc_field.name,
+                            getattr(self._initial, dc_field.name))
         logger.info("Settings dialog: collected parameters from dialog")
         return params

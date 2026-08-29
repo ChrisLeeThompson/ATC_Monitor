@@ -123,7 +123,12 @@ class ControlsGroupBox(QGroupBox):
         # Spacer label
         self.spacer_label = QLabel(" ")
         # Checkboxes
-        self.show_grayscale_images_checkbox = QCheckBox("Show Grayscale Images")
+        # "Show RTM Images", not "Show Grayscale Images" (renamed 2026-08-28):
+        # the Top-Hat foreground map is itself grayscale, so "grayscale" no
+        # longer distinguishes the scene view from the analysis view. The
+        # attribute and the show_grayscale_images settings key are stable
+        # identifiers and keep their names.
+        self.show_grayscale_images_checkbox = QCheckBox("Show RTM Images")
         self.show_grayscale_images_checkbox.setChecked(self.initial_values.show_grayscale_images)
         self.save_data_checkbox = QCheckBox("Save Data")
         self.save_data_checkbox.setChecked(self.initial_values.save_data)
@@ -153,7 +158,7 @@ class ControlsGroupBox(QGroupBox):
         self.match_score_threshold_label.setToolTip(AppStyles.AppToolTips.MATCH_SCORE_THRESHOLD_LABEL)
         self.maximum_pixels_threshold_label.setToolTip(AppStyles.AppToolTips.MAXIMUM_PIXELS_THRESHOLD_LABEL)
         self.confirmation_rounds_label.setToolTip(AppStyles.AppToolTips.CONFIRMATION_ROUNDS_LABEL)
-        self.show_grayscale_images_checkbox.setToolTip(AppStyles.AppToolTips.SHOW_GRAYSCALE_IMAGES_CHECKBOX)
+        self.show_grayscale_images_checkbox.setToolTip(AppStyles.AppToolTips.SHOW_RTM_IMAGES_CHECKBOX)
         self.save_data_checkbox.setToolTip(AppStyles.AppToolTips.SAVE_DATA_CHECKBOX)
     
     def _setup_connections(self):
@@ -331,17 +336,6 @@ class ControlsGroupBox(QGroupBox):
         self.image_count_radio.setEnabled(enabled)
         self.time_interval_radio.setEnabled(enabled)
     
-    def set_settings_button_enabled(self, enabled: bool):
-        """
-        Enable or disable the Settings button.
-        
-        Disabled during monitoring because processing parameters
-        are locked once the worker is running.
-        
-        :param enabled: True to enable, False to disable
-        """
-        self.settings_button.setEnabled(enabled)
-
     def set_pixels_threshold_label(self, text: str):
         """
         Set the maximum-pixels threshold label text.

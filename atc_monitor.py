@@ -1,38 +1,24 @@
 """
 ATC Monitor
-.
+
 This UI is designed to analyze real-time monitor (RTM) data generated from a Thermo Scientific FIB-SEM microscope.
 Specifically, it processes RTM images while Thermo Scientific AutoTEM Cryo performs rough milling with one or two rectangle patterns.
 The script supports rectangle patterns only (regular cross-section and cleaning cross-section patterns are rejected during validation).
-.
+
 The application runs in the background while FIB patterns are generating RTM data. Based on analysis of the images, the application
 will stop FIB patterning if certain criteria are met.
-.
+
 Thermo Scientific AutoScript 4.13+ is required, and the application uses only modules included with AutoScript (no extra dependencies).
 Script created with the assistance of Claude Code.
-.
+
 If you have any questions or suggestions for improvements, please contact me (Chris Thompson on GitHub: ChrisLeeThompson).
-.
+
 Thank you,
 Chris Thompson
-.
-.
-.
-MIT License
-.
-Copyright 2026 Christopher Thompson
-.
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”),
-to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-.
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-.
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-"""
 
+Copyright (c) 2026 Christopher Thompson.
+Released under the MIT License -- see the LICENSE file.
+"""
 import atexit
 import gc
 import logging
@@ -75,7 +61,7 @@ from script_modules.settings_dialog import SettingsDialog
 logger = logging.getLogger(__name__)
 
 # Held module-global for the process lifetime so the file object backing
-# faulthandler is NEVER garbage-collected/closed. faulthandler writes to the
+# faulthandler is never garbage-collected/closed. faulthandler writes to the
 # raw file descriptor at crash time; a closed fd would mean the native-fault
 # traceback is silently lost -- the exact failure this is meant to capture.
 _FAULT_FP = None
@@ -153,9 +139,11 @@ class MainWindow(QMainWindow):
         self._gui_watchdog = None
 
         # Drives information_label_2 (catbug status message). Combined via
-        # _update_monitoring_message() with precedence stopped > paused >
-        # detecting > idle.
+        # _update_monitoring_message() with precedence stopped > connecting >
+        # paused > detecting > idle.
         self._monitoring_running = False
+        self._monitoring_connecting = False  # True from Start click until the
+                                             # worker confirms the connection
         self._monitoring_paused = False
         self._monitoring_detecting = False   # mirrors catbug color: True = colored/active
 
@@ -239,13 +227,29 @@ class MainWindow(QMainWindow):
             self.pattern_two_group_box
         ]
         
-        # Restore saved crop rectangles from previous session
+        # Restore saved crop rectangles from previous session. Preferred
+        # form: fractions of the capture-time image, so the crop lands on the
+        # same portion of the pattern whatever size this session's images are
+        # (field request 2026-08-28). Absolute pixels remain the fallback for
+        # settings saved before the image size was recorded -- one launch,
+        # then the size is saved too.
         saved_crops = [
-            self.params.processing.crop_rect_pattern_1,
-            self.params.processing.crop_rect_pattern_2
+            (self.params.processing.crop_rect_pattern_1,
+             self.params.processing.crop_img_size_pattern_1),
+            (self.params.processing.crop_rect_pattern_2,
+             self.params.processing.crop_img_size_pattern_2),
         ]
-        for group_box, crop_rect in zip(self.pattern_group_boxes, saved_crops):
-            if crop_rect is not None:
+        for group_box, (crop_rect, img_size) in zip(self.pattern_group_boxes,
+                                                    saved_crops):
+            if crop_rect is None:
+                continue
+            if img_size and img_size[0] > 0 and img_size[1] > 0:
+                img_w, img_h = img_size
+                group_box.rtm_plot.set_saved_crop_fractions(
+                    crop_rect.x() / img_w, crop_rect.y() / img_h,
+                    crop_rect.width() / img_w, crop_rect.height() / img_h
+                )
+            else:
                 group_box.rtm_plot.set_saved_crop_rect(
                     crop_rect.x(), crop_rect.y(),
                     crop_rect.width(), crop_rect.height()
@@ -354,7 +358,7 @@ class MainWindow(QMainWindow):
         spinbox = self.controls_group_box.match_score_threshold_spinbox
         spinbox.blockSignals(True)
         spinbox.setValue(threshold)
-        # Read back the spinbox's QUANTIZED value and use it everywhere: the
+        # Read back the spinbox's quantized value and use it everywhere: the
         # raw drag position carries more decimals than the spinbox displays or
         # persists, and gating the worker at an invisible value means the same
         # displayed configuration behaves differently after a restart.
@@ -362,7 +366,7 @@ class MainWindow(QMainWindow):
         spinbox.blockSignals(False)
         # Update central parameters
         self.params.ui.match_score_threshold = threshold
-        # Snap BOTH plots' lines to the quantized value (the source line sits
+        # Snap both plots' lines to the quantized value (the source line sits
         # at the raw drag position otherwise; set_* does not re-emit).
         other_idx = 1 - source_idx
         self.pattern_group_boxes[other_idx].set_match_score_threshold(threshold)
@@ -391,13 +395,19 @@ class MainWindow(QMainWindow):
     @Slot(int, int, int, int)
     def _on_pattern_one_crop_changed(self, x: int, y: int, width: int, height: int):
         """Handle crop rectangle changes from Pattern One RTM plot."""
-        self.params.update_crop_rect_pattern_1(x, y, width, height)
+        plot = self.pattern_one_group_box.rtm_plot
+        self.params.update_crop_rect_pattern_1(
+            x, y, width, height,
+            img_width=plot.image_width, img_height=plot.image_height)
         logger.info(f"Pattern 1 crop updated: x={x}, y={y}, width={width}, height={height}")
-    
+
     @Slot(int, int, int, int)
     def _on_pattern_two_crop_changed(self, x: int, y: int, width: int, height: int):
         """Handle crop rectangle changes from Pattern Two RTM plot."""
-        self.params.update_crop_rect_pattern_2(x, y, width, height)
+        plot = self.pattern_two_group_box.rtm_plot
+        self.params.update_crop_rect_pattern_2(
+            x, y, width, height,
+            img_width=plot.image_width, img_height=plot.image_height)
         logger.info(f"Pattern 2 crop updated: x={x}, y={y}, width={width}, height={height}")
     
     def _refresh_metric_labels(self):
@@ -422,20 +432,89 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_settings_requested(self):
-        """Open the settings dialog and apply changes on accept."""
+        """Open the settings dialog and apply changes on accept.
+
+        The dialog stays reachable during a run. While monitoring is active it
+        opens with everything except the Contrast/Brightness Calibration group
+        disabled, and the CB changes are pushed into the running worker to take
+        effect at the next patterning session.
+        """
         dialog = SettingsDialog(
             parent=self,
             constraints=self.params.spin_box_constraints,
-            processing_params=self.params.processing
+            processing_params=self.params.processing,
+            monitoring_active=self._monitoring_running
         )
         if dialog.exec() == SettingsDialog.DialogCode.Accepted:
-            self.params.processing = dialog.get_parameters()
+            updated = dialog.get_parameters()
+            # _monitoring_running is read at two instants: at construction
+            # (above, deciding the lock) and here (deciding the push). The
+            # modal keeps the event loop spinning, so a run can auto-stop
+            # while the dialog is open; CB edits made in that window are
+            # saved but not pushed, which is the right outcome -- the worker
+            # they would have gone to is stopping.
+            live_changes = (dialog.live_editable_changes(updated)
+                            if self._monitoring_running else {})
+            self.params.processing = updated
             self.params.save_settings()
             # The binarization method may have changed -> keep the foreground
             # metric labels honest (white-pixel % vs Top-Hat energy).
             self._refresh_metric_labels()
             logger.info("Advanced settings updated and saved")
             crash_breadcrumbs.drop("settings-saved")
+            if live_changes:
+                self._push_live_cb_settings(live_changes)
+        # Destroy the dialog. It is parented to this window, so dropping the
+        # Python reference alone leaves the full widget tree (~150 widgets,
+        # each with its own stylesheet) alive as a hidden child forever --
+        # one leaked tree and native window per Settings open, growing the
+        # child list every style/font propagation walks and the process's
+        # USER-handle count. deleteLater, not WA_DeleteOnClose: the values
+        # are read from the dialog after exec() returns.
+        dialog.deleteLater()
+
+    def _push_live_cb_settings(self, changes: dict):
+        """
+        Route CB settings changed during a run into the worker.
+
+        Emitted through the same request_worker_param signal the panel controls
+        use, so they land on the lock-protected queue and drain at a batch
+        boundary. They are classified DEFERRED, so the status bar tells the
+        operator they apply to the next patterning session -- which is the truth:
+        the calibration reads them once, when it builds its CBEdgeConfig.
+
+        :param changes: {field_name: new_value} from live_editable_changes
+        """
+        for name, value in changes.items():
+            self.request_worker_param.emit(name, value, -1)
+        logger.info(
+            f"Auto CB settings pushed to the running worker: "
+            f"{', '.join(sorted(changes))}"
+        )
+        # The completion thresholds were tuned at the current detector operating
+        # point, and all three criteria are measured on a fixed absolute scale --
+        # mean slope included, since it is the slope of the mean pixel value over
+        # the raw analysis image. One Start->Stop run spans several patterning
+        # sessions, so a darker or brighter lock on the next lamella rescales
+        # every metric while the thresholds carry over unchanged. That is
+        # inherent to re-calibrating mid-run, not a defect, so say it plainly.
+        #
+        # The criterion names are deliberately not spelled out: the percent-pixels
+        # control is relabeled per binarization method (Percent Pixels vs
+        # Foreground Energy, see _refresh_metric_labels), so naming it here would
+        # be wrong in Top-Hat mode and would need maintaining alongside the label.
+        # A brief timed note, not a standing warning (operator choice,
+        # 2026-08-28). The sticky form outlived intuition: turning
+        # recalibration off makes "the next calibration" unreachable for the
+        # rest of the run, so the reminder's own clearing condition never
+        # fired and it stood through session restarts. "Calibration", not
+        # "patterning session": under the default first-session-only cadence,
+        # later sessions do not recalibrate, so changed settings genuinely
+        # wait for the next calibration.
+        if any(name != "auto_cb_on_start" for name in changes):
+            self.status_bar.set_timed_status_text(
+                "Auto CB: settings apply at the next calibration", 5
+            )
 
     # ========================================
     # Button Click Handlers
@@ -458,17 +537,37 @@ class MainWindow(QMainWindow):
         self.pause_resume_button.setEnabled(True)
         self.pause_resume_button.setText("Pause")
         self.stop_button.setEnabled(True)
-        self.controls_group_box.set_settings_button_enabled(False)
+        # The Settings button stays live during a run. The dialog opens with
+        # everything except the Contrast/Brightness Calibration group disabled,
+        # so the operator can read every current value and retune Auto CB
+        # without stopping monitoring (see _on_settings_requested).
 
         # Disable mode switching and save data during processing
         self.controls_group_box.set_monitoring_mode_enabled(False)
         self.controls_group_box.save_data_checkbox.setEnabled(False)
 
-        # Run begins -> catbug message shows "Monitoring (waiting for patterning)..." (gray until first detection)
+        # Run begins in the connecting state: the catbug message and the
+        # bar's right-side connection indicator say "Connecting to
+        # microscope..." until the worker confirms the connection
+        # (microscope_connected -> on_microscope_connected), and only then
+        # may the app claim "waiting for patterning". Previously the claim
+        # appeared at Start click, which was misleading when no microscope
+        # was reachable.
         self._monitoring_running = True
+        self._monitoring_connecting = True
         self._monitoring_paused = False
         self._monitoring_detecting = False
         self._update_monitoring_message()
+        # A fresh run starts with a clean left bar (a standing advisory from
+        # the previous run describes a detector state this run is about to
+        # re-establish or recalibrate); the connection state lives in the
+        # right-side indicator, keeping the whole left area for messages to
+        # the operator.
+        self.status_bar.clear_warning()
+        self.status_bar.set_status_text("")
+        self.status_bar.set_connection_text(
+            AppStyles.AppText.WINDOW_INFO_CONNECTING
+        )
 
         # Create worker parameters from current UI values
         params = self._create_worker_parameters()
@@ -527,7 +626,7 @@ class MainWindow(QMainWindow):
                 return
 
         if self.worker is not None:
-            # Drop the GUI->worker control connections BEFORE destroying: their
+            # Drop the GUI->worker control connections before destroying: their
             # sender (this window) outlives the worker, so without this they
             # accumulate per Start and would deliver into a dead worker's
             # slots. Worker-as-sender connections need no explicit disconnect;
@@ -584,16 +683,16 @@ class MainWindow(QMainWindow):
         """
         Crash-diagnosis instrumentation (2026-08-14 heap-corruption follow-up):
         the on-tool log showed the 'Post-connect: N live threads' count growing
-        2 -> 6 across Start/Stop cycles. That is EITHER worker threads genuinely
+        2 -> 6 across Start/Stop cycles. That is either worker threads genuinely
         outliving Stop (a real leak, and a prime suspect for the 0xc0000374
-        heap corruption) OR stale threading._DummyThread bookkeeping for
+        heap corruption) or stale threading._DummyThread bookkeeping for
         already-exited Qt threads (CPython cannot observe a foreign thread's
         death). This check runs shortly after each stop and logs the QThread's
-        OWN state, which is authoritative -- the next field session's log
+        own state, which is authoritative -- the next field session's log
         settles the question. When the thread has genuinely finished, its
         objects are reaped immediately instead of at the next Start.
 
-        ``thread`` is bound at schedule time so a quick Start of a NEW run
+        ``thread`` is bound at schedule time so a quick Start of a new run
         cannot be mistaken for the old thread failing to exit.
         """
         if thread is None or thread is not self.worker_thread:
@@ -649,7 +748,7 @@ class MainWindow(QMainWindow):
         
         Uses centralized parameter architecture:
         1. Sync UI params from controls
-        2. Read ONLY from self.params when creating worker
+        2. Read only from self.params when creating worker
         3. Include criteria enabled flags from checkboxes
         """
         # Sync central params with current UI state
@@ -725,9 +824,11 @@ class MainWindow(QMainWindow):
 
             # Auto contrast/brightness calibration (from central params)
             auto_cb_on_start=self.params.processing.auto_cb_on_start,
+            cb_recalibrate_every_session=(
+                self.params.processing.cb_recalibrate_every_session),
             cb_white_level=self.params.processing.cb_white_level,
-            cb_target_median_fraction=self.params.processing.cb_target_median_fraction,
-            cb_target_contrast_span=self.params.processing.cb_target_contrast_span,
+            cb_lower_margin=self.params.processing.cb_lower_margin,
+            cb_upper_margin=self.params.processing.cb_upper_margin,
             cb_max_white_clip_fraction=self.params.processing.cb_max_white_clip_fraction,
             cb_max_black_clip_fraction=self.params.processing.cb_max_black_clip_fraction,
             cb_min_bound=self.params.processing.cb_min_bound,
@@ -747,6 +848,7 @@ class MainWindow(QMainWindow):
         """Connect all worker signals to appropriate GUI slots."""
         # Control Signals
         self.worker.monitoring_started.connect(self.on_monitoring_started)
+        self.worker.microscope_connected.connect(self.on_microscope_connected)
         self.worker.monitoring_stopped.connect(self.on_monitoring_stopped)
         self.worker.monitoring_paused.connect(self.on_monitoring_paused)
         self.worker.monitoring_resumed.connect(self.on_monitoring_resumed)
@@ -760,6 +862,9 @@ class MainWindow(QMainWindow):
         # stack.
         self.worker.status_update.connect(self._on_status_update)
         self.worker.persistent_status_update.connect(self.status_bar.set_status_text)
+        self.worker.warning_status_update.connect(self.status_bar.set_warning_text)
+        self.worker.connection_status_update.connect(
+            self.status_bar.set_connection_text)
         
         # Image Display Signals
         self.worker.processed_image_ready.connect(self.on_processed_image_ready)
@@ -788,7 +893,7 @@ class MainWindow(QMainWindow):
             self.monitoring_icon.set_monitoring_active
         )
 
-        # Control signals INTO the worker, wired DirectConnection on purpose.
+        # Control signals into the worker, wired DirectConnection on purpose.
         # run() blocks the worker thread and no longer pumps its event loop, so a
         # QueuedConnection would never be delivered. Direct slots run on the GUI
         # thread and only set thread-safe flags (stop/pause/resume bools, which
@@ -804,13 +909,13 @@ class MainWindow(QMainWindow):
         """
         Connect UI controls to the worker for live parameter updates.
 
-        Connected ONCE (from __init__), not per-Start: handlers emit the
+        Connected once (from __init__), not per-Start: handlers emit the
         request_worker_param signal, which is bound to the worker per-Start.
         With no active worker the signal has no connection and emitting is a
         no-op, so these UI controls are safe to leave connected for the app's
         lifetime (this also fixes the prior per-Start connection leak).
         """
-        # Threshold updates apply to BOTH patterns (global thresholds)
+        # Threshold updates apply to both patterns (global thresholds)
         self.controls_group_box.mean_pixel_slope_threshold_spinbox.valueChanged.connect(
             lambda val: self._update_both_patterns('mean_slope_threshold', val)
         )
@@ -823,7 +928,7 @@ class MainWindow(QMainWindow):
             lambda val: self._update_both_patterns('max_pixels_threshold', val)
         )
 
-        # Crop rectangles are INDEPENDENT per pattern
+        # Crop rectangles are independent per pattern
         self.pattern_one_group_box.rtm_plot.crop_changed.connect(
             lambda x, y, w, h: self.request_worker_param.emit(
                 'pattern_1_crop_rect', (x, y, w, h), 0
@@ -849,7 +954,7 @@ class MainWindow(QMainWindow):
             lambda val: self.request_worker_param.emit('analysis_interval_seconds', int(val), -1)
         )
 
-        # Criteria enabled checkboxes → worker (global, not per-pattern)
+        # Criteria enabled checkboxes -> worker (global, not per-pattern)
         self.pattern_results_group_box.criteria_enabled_changed.connect(
             self._on_criteria_enabled_changed
         )
@@ -880,9 +985,11 @@ class MainWindow(QMainWindow):
 
     def _update_monitoring_message(self):
         """Set the catbug status message (information_label_2) from current state.
-        Precedence: stopped > paused > detecting > idle."""
+        Precedence: stopped > connecting > paused > detecting > idle."""
         if not self._monitoring_running:
             text = AppStyles.AppText.WINDOW_INFO_LABEL_2            # "Click Start to begin monitoring."
+        elif self._monitoring_connecting:
+            text = AppStyles.AppText.WINDOW_INFO_CONNECTING         # "Connecting to microscope..."
         elif self._monitoring_paused:
             text = AppStyles.AppText.WINDOW_INFO_MONITORING_PAUSED  # "Monitoring paused"
         elif self._monitoring_detecting:
@@ -902,12 +1009,34 @@ class MainWindow(QMainWindow):
         """1 s GUI heartbeat -> GuiWatchdog (native slot per house rule)."""
         if self._gui_watchdog is not None:
             self._gui_watchdog.beat()
+        # GIL-free stall dump, re-armed every beat. dump_traceback_later runs
+        # on a C thread that needs no GIL, so it captures the one stall class
+        # the Python watchdog thread cannot: a main thread frozen while
+        # holding the GIL starves the watchdog too, and its suspend guard
+        # then re-baselines and stays silent (gui_watchdog's documented blind
+        # spot; the fallback its docstring prescribes is exactly this call).
+        # Each call replaces the previous schedule, so while the heartbeat
+        # runs nothing fires; if it stops, all threads dump to the crash fd
+        # 15 s later, once. exit=False: record, never kill.
+        if _FAULT_FP is not None:
+            try:
+                faulthandler.dump_traceback_later(
+                    15.0, file=_FAULT_FP, exit=False)
+            except Exception:
+                pass
 
     @Slot()
     def _stop_gui_watchdog(self):
         """aboutToQuit: stop the watchdog thread (daemon exit is safe anyway)."""
         if self._gui_watchdog is not None:
             self._gui_watchdog.stop()
+        # Disarm the GIL-free stall dump: after the event loop exits nothing
+        # beats, and a scheduled dump firing mid-interpreter-teardown would
+        # write a phantom stall into the crash record.
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
 
     # ========================================
     # Worker Signal Handlers - Control
@@ -932,6 +1061,14 @@ class MainWindow(QMainWindow):
         
         logger.info("Monitoring started (worker confirmed)")
     
+    @Slot()
+    def on_microscope_connected(self):
+        """Worker confirmed the microscope connection: leave the connecting
+        state, so the catbug message may truthfully claim monitoring."""
+        self._monitoring_connecting = False
+        self._update_monitoring_message()
+        logger.info("Microscope connection confirmed by worker")
+
     @Slot(str)
     def on_monitoring_stopped(self, message: str):
         """Handle monitoring_stopped signal from worker."""
@@ -940,19 +1077,25 @@ class MainWindow(QMainWindow):
         self.pause_resume_button.setEnabled(False)
         self.pause_resume_button.setText("Pause")
         self.stop_button.setEnabled(False)
-        self.controls_group_box.set_settings_button_enabled(True)
-        
+
         # Re-enable mode switching and save data
         self.controls_group_box.set_monitoring_mode_enabled(True)
         self.controls_group_box.save_data_checkbox.setEnabled(True)
 
         # Run ended -> catbug message reverts to "Click Start to begin monitoring."
         self._monitoring_running = False
+        self._monitoring_connecting = False
         self._monitoring_paused = False
         self._monitoring_detecting = False
         self._update_monitoring_message()
+        # Backstop for the worker's own cleanup emission: the indicator must
+        # never keep claiming a connection after the run that owned it ended.
+        self.status_bar.set_connection_text(AppStyles.StatusText.NOT_CONNECTED)
 
-        # Display message
+        # Display the stop reason. Clear the warning first: the reason a run
+        # ended must never hide behind a stale advisory, and the advisory
+        # described a run that no longer exists.
+        self.status_bar.clear_warning()
         self.status_bar.set_status_text(message)
 
         logger.info(f"Monitoring stopped: {message}")
@@ -986,9 +1129,14 @@ class MainWindow(QMainWindow):
     
     @Slot(str)
     def on_error_occurred(self, error_message: str):
-        """Handle error_occurred signal from worker."""
-        # Show error in status bar
-        self.status_bar.set_status_text(f"Error: {error_message}")
+        """Handle error_occurred signal from worker -- log only.
+
+        Deliberately never touches the status bar: every error_occurred path
+        ends in monitoring_stopped, which puts the operator-worded stop
+        reason on the bar exactly once. Writing the raw error here raced
+        that message (and lost or doubled, depending on delivery order);
+        the detail belongs in the log.
+        """
         logger.error(f"Worker error: {error_message}")
     
     @Slot()
@@ -1038,26 +1186,31 @@ class MainWindow(QMainWindow):
     # Worker Signal Handlers - Images
     # ========================================
     
+    def _analysis_view_title(self) -> str:
+        """The panel title for the analysis view (checkbox unchecked). The
+        Top-Hat method emits a grayscale foreground map, not a binary image,
+        so the title must name what is actually on screen."""
+        is_energy = self.params.processing.binarization_method.name == "TOPHAT_ENERGY"
+        return "Top-Hat Foreground Map" if is_energy else "Binary RTM Image"
+
     @Slot(object, int)
     def on_processed_image_ready(self, image, pattern_idx):
-        """Handle processed_image_ready signal - display when grayscale mode is active."""
+        """Handle processed_image_ready signal - display when the scene view
+        (Show RTM Images) is active."""
         if not self.controls_group_box.show_grayscale_images_checkbox.isChecked():
-            return  # Binary mode - skip grayscale display
+            return  # Analysis view active - skip the scene display
         self.pattern_group_boxes[pattern_idx].rtm_plot.plot_image(
             image, title="Processed RTM Image"
         )
 
     @Slot(object, int)
     def on_binary_image_ready(self, image, pattern_idx):
-        """Handle binary_image_ready signal - display when binary mode is active (default)."""
+        """Handle binary_image_ready signal - display when the analysis view
+        is active (Show RTM Images unchecked)."""
         if self.controls_group_box.show_grayscale_images_checkbox.isChecked():
-            return  # Grayscale mode - skip binary display
-        # The Top-Hat method emits a grayscale foreground map, not a binary image,
-        # so title it honestly when that method is active.
-        is_energy = self.params.processing.binarization_method.name == "TOPHAT_ENERGY"
-        title = "Top-Hat Foreground Map" if is_energy else "Binary RTM Image"
+            return  # Scene view active - skip the analysis display
         self.pattern_group_boxes[pattern_idx].rtm_plot.plot_image(
-            image, title=title
+            image, title=self._analysis_view_title()
         )
 
     @Slot(int, str, float)
@@ -1106,9 +1259,9 @@ class MainWindow(QMainWindow):
         - slope_ok, match_ok, pixels_ok (bool, monitoring phase only) -- the
           worker's authoritative per-criterion pass/fail for the indicators
         - pixels_via ("ABS"/"STALL"/None) -- which path satisfied the
-          foreground criterion on THIS round; drives the live "(stall)"
+          foreground criterion on this round; drives the live "(stall)"
           annotation
-        - stall_in_streak (bool) -- sticky: True if ANY round of the current
+        - stall_in_streak (bool) -- sticky: True if any round of the current
           confirmation streak passed via the stall latch; makes the
           annotation durable on the frozen completion panel
         - criteria_met_batch (int or None)
@@ -1148,10 +1301,10 @@ class MainWindow(QMainWindow):
             )
             # Annotate the foreground criterion while it is passing via the
             # stall latch (the trace has floored above the absolute threshold),
-            # so the operator can see WHICH path is satisfying it - shown from
+            # so the operator can see which path is satisfying it - shown from
             # the first stall-latched round, not just at completion. On the
             # completion round the sticky streak flag takes over: the panel
-            # freezes with THIS text, and a streak can mix ABS and STALL
+            # freezes with this text, and a streak can mix ABS and STALL
             # rounds, so keying the final render on pixels_via alone would
             # leave the durable panel unannotated whenever the arbitrary last
             # round happened to pass via ABS (UI review 2026-08-18) - the
@@ -1159,7 +1312,7 @@ class MainWindow(QMainWindow):
             via_stall = (results.get('pixels_via') == "STALL"
                          or (results.get('is_complete')
                              and results.get('stall_in_streak')))
-            # "(stall)" renders on a SECOND line: the results panel reserves
+            # "(stall)" renders on a second line: the results panel reserves
             # the two-line cell size at construction, so the annotation costs
             # no window width (the right column absorbs the height in its
             # existing stretch) and neither dimension moves mid-run.
@@ -1233,11 +1386,6 @@ class MainWindow(QMainWindow):
     # Utility Methods
     # ========================================
     
-    @Slot(str)
-    def set_status_message(self, message: str):
-        """Set the status bar message."""
-        self.status_bar.set_status_text(message)
-    
     @Slot(bool)
     def set_monitoring_active(self, active: bool):
         """Set the monitoring status in the status bar."""
@@ -1270,7 +1418,7 @@ class MainWindow(QMainWindow):
         save finalization but prevents a "QThread: Destroyed while thread is
         still running" abort on teardown.
 
-        This intentionally does NOT stop the FIB beam: a separate application
+        This intentionally does not stop the FIB beam: a separate application
         controls the mill, so leaving milling active on close is by design.
         """
         thread = self.worker_thread
@@ -1295,7 +1443,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Save settings and clean up when the window is closed."""
-        # Breadcrumb first: a WATCHDOG dump during the shutdown wait below is
+        # Breadcrumb first: a watchdog dump during the shutdown wait below is
         # then self-attributing (hang-on-close vs hang-mid-run).
         crash_breadcrumbs.drop("close-event")
         # Stop the monitoring worker first so it can finalize any in-progress
@@ -1316,21 +1464,36 @@ class MainWindow(QMainWindow):
         criteria_enabled = self.pattern_results_group_box.get_criteria_enabled()
         self.params.update_ui_from_dict(criteria_enabled)
         
-        # Sync crop rectangles from plot widgets (captures default 85% crop
-        # even if user never manually adjusted it)
-        for i, group_box in enumerate(self.pattern_group_boxes):
-            crop = group_box.rtm_plot.get_crop_dimensions()
-            if crop is not None:
-                x, y, w, h = crop
-                if i == 0:
-                    self.params.update_crop_rect_pattern_1(x, y, w, h)
-                else:
-                    self.params.update_crop_rect_pattern_2(x, y, w, h)
+        self._sync_crop_params_from_widgets()
         
         # Persist to QSettings
         self.params.save_settings()
         
         super().closeEvent(event)
+
+    def _sync_crop_params_from_widgets(self):
+        """Pull each pattern's drawn crop (and the image size it sits on)
+        into params ahead of a settings save -- capturing the default 85%
+        crop even when the operator never adjusted it.
+
+        Widgets that never displayed a frame are skipped: their drawn crop
+        is the construction-time placeholder, and saving it clobbered the
+        operator's real crop when an app was opened and closed without ever
+        receiving a frame (field data, 2026-08-28 -- the fraction restore
+        then faithfully reproduced the placeholder's 85% geometry). The
+        loaded params values pass through unchanged instead."""
+        updaters = (self.params.update_crop_rect_pattern_1,
+                    self.params.update_crop_rect_pattern_2)
+        for group_box, update in zip(self.pattern_group_boxes, updaters):
+            plot = group_box.rtm_plot
+            if not plot.has_received_image():
+                continue
+            crop = plot.get_crop_dimensions()
+            if crop is not None:
+                x, y, w, h = crop
+                update(x, y, w, h,
+                       img_width=plot.image_width,
+                       img_height=plot.image_height)
 
     @staticmethod
     def _get_script_root() -> Path:
@@ -1351,7 +1514,7 @@ def _qt_message_handler(mode, context, message):
     before it calls abort()) into our log, so a Qt-triggered crash is preceded
     by the exact reason instead of a bare "Aborted".
 
-    NOTE: this handler can only LOG a QtFatalMsg -- Qt calls abort() immediately
+    Note: this handler can only log a QtFatalMsg -- Qt calls abort() immediately
     after it returns, and returning does not cancel that. The actual prevention
     for the "Cannot create window: no screens available" fatal lives in
     BasePlotWidget._guarded_draw, which skips canvas draws while no display is
@@ -1363,7 +1526,7 @@ def _qt_message_handler(mode, context, message):
             return
         if mode == QtMsgType.QtFatalMsg:
             logger.critical(f"Qt FATAL: {message}")
-            # The logger call above is only an ENQUEUE now (QueueHandler):
+            # The logger call above is only an enqueue now (QueueHandler):
             # Qt aborts the process the moment this handler returns, atexit
             # never runs, and the listener thread may never drain the queue --
             # so the fatal reason would be racy-lost, the exact blindness this
@@ -1452,7 +1615,7 @@ def _local_logs_dir() -> Path:
     """
     Local-disk directory (%LOCALAPPDATA%/ATC_Monitor/logs). Two roles:
 
-    1. Home of faulthandler.log, ALWAYS. It is written through a raw kept-open
+    1. Home of faulthandler.log, always. It is written through a raw kept-open
        fd at crash time; a hung SMB write at that moment would hang the crash
        dump itself, so the crash-time record must never live on the network
        share. Non-trivial content is swept into <script dir>/logs/
@@ -1463,7 +1626,7 @@ def _local_logs_dir() -> Path:
     History: pre-3.3.2 the rotating app log lived here too, as part of the fix
     for the 2026-08-14 heap-corruption crash (0xc0000374) that died in
     worker-thread RotatingFileHandler.shouldRollover -> os.path.exists on the
-    UNC share. The queue indirection (a single listener thread owns ALL file
+    UNC share. The queue indirection (a single listener thread owns all file
     I/O, see setup_logging) is what actually removes that stack from worker
     threads, so the app log could move back beside the script; local disk
     remains the crash-time and fallback location.
@@ -1478,7 +1641,7 @@ def _local_logs_dir() -> Path:
 # diagnostic that matters, and an unbounded SMB write at startup is not.
 _FAULT_MIRROR_MAX_BYTES = 1_000_000
 
-# Cap on the script-dir mirror FILE itself -- the one append-only log with no
+# Cap on the script-dir mirror file itself -- the one append-only log with no
 # rotation. Since the v3.3.6 breadcrumbs every session appends a trail (a few
 # KB), not just crashes, so without this the mirror grows forever.
 _FAULT_MIRROR_FILE_CAP_BYTES = 5_000_000
@@ -1486,7 +1649,7 @@ _FAULT_MIRROR_FILE_CAP_BYTES = 5_000_000
 
 def _trim_fault_mirror(mirror_path):
     """
-    Keep the fault-log mirror bounded by ROTATING it (rename to .1) when it
+    Keep the fault-log mirror bounded by rotating it (rename to .1) when it
     outgrows the cap; the caller's append then recreates a fresh file. A
     rotation never destroys bytes -- the mirror is shared by every machine
     launched from one deployment, and an in-place read-trim-rewrite could
@@ -1527,13 +1690,13 @@ def _fault_log_has_content(text: str) -> bool:
 
 def _mirror_fault_log(local_logs, script_logs) -> None:
     """
-    One-shot startup sweep of crash residue from the LOCAL faulthandler.log
+    One-shot startup sweep of crash residue from the local faulthandler.log
     into <script dir>/logs/faulthandler.log, putting native-crash evidence
     beside the app log that gets read in the field. Crash-time writes stay
     local (see _local_logs_dir); only this after-the-fact copy touches the
     share, at startup, where a slow SMB write is harmless.
 
-    Must run BEFORE the faulthandler-open block in setup_logging: a
+    Must run before the faulthandler-open block in setup_logging: a
     successful mirror truncates the local file, and that has to happen before
     _FAULT_FP reopens it for append and writes this run's armed banner.
 
@@ -1558,7 +1721,7 @@ def _mirror_fault_log(local_logs, script_logs) -> None:
             text = swept
             if not _fault_log_has_content(text):
                 # Banner-only residue (~45 bytes per launch): nothing to say,
-                # so write nothing -- and do NOT truncate, the banners are
+                # so write nothing -- and do not truncate, the banners are
                 # the per-launch arming record.
                 return
             if script_logs is None:
@@ -1590,8 +1753,8 @@ def _mirror_fault_log(local_logs, script_logs) -> None:
                 "Fault-log mirror to script dir failed; local copy kept: %s",
                 local_path, exc_info=True)
             return
-        # Reset the local file ONLY now that the mirror fully succeeded, and
-        # drop ONLY the bytes actually mirrored: another instance of the app
+        # Reset the local file only now that the mirror fully succeeded, and
+        # drop only the bytes actually mirrored: another instance of the app
         # can be running with this file open for append (it is shared per
         # account), and a blind truncate would silently destroy a crash dump it
         # wrote while the SMB append above was in flight -- the single
@@ -1632,7 +1795,7 @@ def _script_logs_dir() -> Path:
 
 
 # ---- Console policy --------------------------------------------------------
-# Applies to the stderr sink ONLY; the rotating file log always receives full
+# Applies to the stderr sink only; the rotating file log always receives full
 # INFO telemetry (Auto CB traces, match scores -- the field-diagnosis record).
 #   quiet console:    _CONSOLE_LEVEL = logging.WARNING
 #   key events only:  _CONSOLE_LEVEL = logging.INFO (default, with noise filter)
@@ -1651,7 +1814,7 @@ class _ConsoleNoiseFilter(logging.Filter):
     Blocklist semantics -- allow everything except known-noisy message
     families, matched by substring (several carry a variable "Pattern N: "
     prefix, so startswith would miss them). Fails open, and WARNING and above
-    ALWAYS pass, so the filter can never hide a warning/error.
+    always pass, so the filter can never hide a warning/error.
     """
 
     NOISY_SUBSTRINGS = (
@@ -1678,10 +1841,10 @@ class _ConsoleNoiseFilter(logging.Filter):
 
 def setup_logging():
     """
-    Configure logging: a concise stderr console PLUS a durable rotating file
+    Configure logging: a concise stderr console plus a durable rotating file
     log (in <script dir>/logs, falling back to %LOCALAPPDATA%/ATC_Monitor/logs,
     fed through a queue so no worker thread ever performs file I/O) and
-    native-fault capture to a LOCAL file. Crash residue a previous run left
+    native-fault capture to a local file. Crash residue a previous run left
     in that local file is swept into <script dir>/logs here at startup, so
     all field-readable evidence ends up in one place (see _mirror_fault_log).
 
@@ -1696,10 +1859,10 @@ def setup_logging():
     calling thread. A QueueHandler makes every logger call a lock-free enqueue;
     a single QueueListener thread owns the actual stderr + rotating-file
     handlers -- which is what makes a rotating log on the launch share safe.
-    Trade-offs (accepted): records still in the queue at a HARD crash are lost
-    -- the faulthandler file, written through a raw kept-open fd on LOCAL
+    Trade-offs (accepted): records still in the queue at a hard crash are lost
+    -- the faulthandler file, written through a raw kept-open fd on local
     disk, is the crash-time record. An SMB stall pauses only the listener
-    thread while records buffer in the unbounded in-memory queue; do NOT
+    thread while records buffer in the unbounded in-memory queue; do not
     bound the queue -- a blocking put would reintroduce worker-thread stalls.
     """
     global _FAULT_FP, _LOG_LISTENER
@@ -1732,7 +1895,7 @@ def setup_logging():
 
     sink_handlers: list[logging.Handler] = [console_handler]
     app_log_path = None
-    # delay=False on purpose: the file open happens HERE, once, at startup --
+    # delay=False on purpose: the file open happens here, once, at startup --
     # an unreachable share fails fast and falls through to the local fallback,
     # instead of failing later on the listener thread mid-run.
     for candidate_dir in (script_logs, local_logs):
@@ -1771,8 +1934,8 @@ def setup_logging():
         handlers=root_handlers,
     )
     # basicConfig stamps `fmt` onto the handlers it is given -- but a
-    # QueueHandler must NOT carry the full formatter: its prepare() bakes the
-    # formatted text into record.msg BEFORE the listener's sinks format the
+    # QueueHandler must not carry the full formatter: its prepare() bakes the
+    # formatted text into record.msg before the listener's sinks format the
     # record again (observed as double-prefixed lines). Message-only here;
     # the sinks own the real format. (Exception text is still serialized into
     # the message by prepare(), which is exactly what we want off-thread.)
@@ -1780,7 +1943,7 @@ def setup_logging():
         if isinstance(handler, QueueHandler):
             handler.setFormatter(logging.Formatter("%(message)s"))
 
-    # faulthandler ALWAYS lives on local disk: it writes through the raw fd at
+    # faulthandler always lives on local disk: it writes through the raw fd at
     # crash time, and a hung SMB write at that moment would hang the crash
     # dump itself. Residue is mirrored to the script dir at next startup
     # (_mirror_fault_log below).
@@ -1819,7 +1982,7 @@ def setup_logging():
     except Exception:
         logger.warning("Could not install Qt message handler", exc_info=True)
 
-    # Sweep the previous run's crash residue into the script directory BEFORE
+    # Sweep the previous run's crash residue into the script directory before
     # arming faulthandler: a successful sweep truncates the local file, which
     # must happen before _FAULT_FP reopens it for append and writes this
     # run's armed banner. Ordering is load-bearing.
@@ -1827,7 +1990,7 @@ def setup_logging():
 
     # Dump a Python+C traceback (all threads) if the process is killed by a native
     # fault (e.g. inside the AutoScript C transport), which a normal try/except
-    # cannot catch. Direct it to a SEPARATE, append-mode, kept-open file (NOT the
+    # cannot catch. Direct it to a separate, append-mode, kept-open file (not the
     # logging handler's file): faulthandler writes through the raw fd at crash
     # time and must not interleave with the logging buffer. Append so launch 2
     # never overwrites launch 1's fault. This is the single highest-value
@@ -1875,7 +2038,7 @@ def _install_excepthook(window: "MainWindow"):
     with the monitoring worker still running and its save session unfinalized.
 
     The handler logs the traceback, then best-effort stops the worker and
-    finalizes its saved data (it does NOT stop the beam -- a separate app owns
+    finalizes its saved data (it does not stop the beam -- a separate app owns
     the mill). Finally it chains to the default hook so the traceback still
     reaches stderr.
     """
@@ -1920,7 +2083,7 @@ def main():
     # stack dump to the crash fd if the heartbeat stalls >10 s -- the only
     # instrument that survives a TerminateProcess kill of a ghosted window.
     # Gated on the crash fd: a watchdog dumping to a windowed app's stderr is
-    # worthless. Started here, NOT in setup_logging (tests re-run that against
+    # worthless. Started here, not in setup_logging (tests re-run that against
     # temp dirs and close _FAULT_FP in tearDown).
     if _FAULT_FP is not None:
         window._gui_watchdog = GuiWatchdog(_FAULT_FP)

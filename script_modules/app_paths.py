@@ -4,16 +4,16 @@ Single source for the application's path roots.
 Before v3.3.3 these expressions were duplicated across atc_monitor.py
 (MainWindow._get_script_root, _script_logs_dir, _local_logs_dir) and kept
 "in sync by convention" -- a silent-divergence hazard. atc_monitor.py now
-delegates here; the detailed rationale for WHICH root each consumer uses
+delegates here; the detailed rationale for which root each consumer uses
 (crash-time-local vs. primary-share) stays with the delegates, close to the
 logging setup it constrains.
 
 Leaf module on purpose: imports only os/sys/pathlib so it can never pull Qt
 or app modules into a path lookup.
 
-CRITICAL: every function evaluates sys.argv / os.environ at CALL time, never
-at import time -- tests patch both per-test, and a module-level constant
-would freeze the unpatched values.
+Every function evaluates sys.argv / os.environ at call time, never at
+import time -- this is load-bearing: tests patch both per-test, and a
+module-level constant would freeze the unpatched values.
 """
 import os
 import sys

@@ -4,7 +4,6 @@ Mean pixel value plot widget.
 import matplotlib
 matplotlib.set_loglevel("WARNING")  # Suppress matplotlib debug messages
 import logging
-import numpy as np
 from matplotlib.ticker import AutoLocator, MaxNLocator
 from PySide6.QtCore import Qt
 from script_modules.base_plot_widget import BasePlotWidget
@@ -41,24 +40,9 @@ class MeanPixelPlotWidget(BasePlotWidget):
         # Store the line object for updates
         self.line = None
         
-        # Plot test data for design purposes
-        # self._plot_test_data()
-
         # Draw
         self.canvas.draw()
-    
-    def _plot_test_data(self):
-        """Plot test data for design purposes."""
-        # Generate test data - simulate mean pixel values over frames
-        frames = np.arange(0, 100)
-        # Create realistic-looking mean pixel values with some variation
-        base_value = 128
-        noise = np.random.normal(0, 5, len(frames))
-        drift = np.sin(frames / 20) * 10  # Slow drift
-        mean_values = base_value + noise + drift
-        
-        self.plot_data(frames, mean_values)
-    
+
     def plot_data(self, x_data, y_data):
         """
         Plot mean pixel value data.

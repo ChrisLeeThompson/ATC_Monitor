@@ -1,6 +1,8 @@
 """
 Real-Time Monitor (RTM) processing.
-This module provides functions to convert RTM data into displayable images.
+This module provides functions to convert RTM data into displayable images,
+plus the hardware-free balance metric and control law behind the Auto
+contrast/brightness (CB) detector correction.
 """
 
 import logging
@@ -127,135 +129,74 @@ def precompute_pattern_metadata(rtm_positions):
 #                             using symmetric percentiles so a single hot/dead pixel
 #                             does not skew it (unlike raw vmax - vmin). This is the
 #                             feedback signal for the contrast servo.
+# p2_fraction/p98_fraction: the robust histogram edges as fractions of full
+# scale -- the quantities the edge-margin correction (run_cb_correction)
+# steers. Appended with defaults so the many positional seven-field
+# constructions in tests and simulators stay valid; the solver falls back to
+# median +- span/2 when a fixture leaves them None.
 CBBalance = namedtuple(
     "CBBalance",
     ["white_clip", "black_clip", "median_fraction", "n_valid", "vmin", "vmax",
-     "span_fraction"],
+     "span_fraction", "p2_fraction", "p98_fraction"],
+    defaults=(None, None),
 )
-
-# Tuning for the closed-loop controller. Bounds/targets come from user settings;
-# the gains/step/tol are control parameters.
-#   brightness_gain      : proportional gain mapping the median error (fraction) to a
-#                          brightness adjustment -- shrinks the step near target so the
-#                          loop converges instead of oscillating by a fixed step.
-#   clip_gain            : proportional gain mapping clip-fraction excess to brightness.
-#   brightness_step      : per-iteration CAP on |brightness change| (anti-windup).
-#   target_contrast_span : desired robust occupied span (p_hi - p_lo)/white_level; the
-#                          contrast servo's setpoint (mirrors target_median_fraction).
-#   contrast_gain        : proportional gain mapping the span error to a contrast change.
-#   contrast_tol         : convergence band on the span error.
-#   contrast_step        : per-iteration CAP on |contrast change| (anti-windup).
-#   span_floor           : below this span (flat/degenerate field) the contrast servo
-#                          holds -- there is no real contrast to chase, so don't slam
-#                          the gain to its cap amplifying noise.
-CBControlConfig = namedtuple(
-    "CBControlConfig",
-    [
-        "white_level",
-        "target_median_fraction",
-        "max_white_clip",
-        "max_black_clip",
-        "min_bound",
-        "max_bound",
-        "brightness_step",
-        "brightness_gain",
-        "clip_gain",
-        "contrast_step",
-        "median_tol",
-        "target_contrast_span",
-        "contrast_gain",
-        "contrast_tol",
-        "span_floor",
-    ],
-)
-
-
-# Saturation-aware interior. The median/span that the brightness/contrast servos
-# regulate are measured over the NON-rail interior (0 < x < white_level), so a wall
-# of pixels pinned at a rail can't drag those statistics (which would otherwise pull
-# the median across target and cause a false move). Clip fractions are still measured
-# over ALL valid pixels (the operator's clip budget). Fall back to all valid pixels
-# when the interior is too thin to be a stable estimate.
 _CB_MIN_INTERIOR_FRACTION = 0.02   # interior must be >= 2% of valid pixels ...
-_CB_MIN_INTERIOR_COUNT = 50        # ... and >= this many, else use all valid pixels
+_CB_MIN_INTERIOR_COUNT = 50        # ... and >= this many, else use all valid pixels.
+                                   # Coupled to _CB_SPAN_BLIND_INTERIOR below: this
+                                   # switch changes which population the median/span
+                                   # describe, so moving it moves the regime the
+                                   # empirical blindness threshold was calibrated in
+                                   # (the 2026-08-23 frames sat at 2.4% interior,
+                                   # just above this fallback)
 
-# Declip / cost / acceptance tunables (internal; promotable to CBControlConfig if
+# Declip / cost / acceptance tunables (internal; promotable to CBEdgeConfig if
 # operators ever need them).
-_CB_TAINTED_SPAN_PENALTY = 0.15  # ADDED to the span-error cost term when a clipped
-                                 # rail pins a percentile and fakes an on-target span
-                                 # (additive since v3.3.8; was a floor)
-_CB_HARD_CLIP_FRACTION = 0.30    # clip fraction at/above which a rail DOMINATES the
-                                 # histogram: the span reading is meaningless and the
-                                 # cure is prescribed by which rail it is
-_CB_STALL_EPS = 0.02             # all four balance metrics moving less than this
-                                 # after a knob change counts as a stall (0.02, not
-                                 # 0.01: 1-frame field noise is ~0.01-0.08, so the
-                                 # old value never fired on-tool; the saturated
-                                 # regime where stalls matter is rail-pinned and
-                                 # nearly noiseless, so 0.02 still fires there)
-_CB_STEP_GROWTH = 2.0            # walk/declip step escalation multiplier
-_CB_SPAN_RECOVERY_TRIES = 3      # bounded contrast-up attempts on a clean but
-                                 # degenerate (span <= floor) field
-
+_CB_HARD_CLIP_FRACTION = 0.30    # clip fraction at/above which a rail dominates the
+                                 # histogram: the frame is deterministic (bit-identical
+                                 # statistics there are real, not a stale buffer) and
+                                 # the cure is prescribed by which rail it is. The span
+                                 # is still readable at this level -- only
+                                 # _CB_SPAN_BLIND_INTERIOR below marks median/span
+                                 # unreadable, and it is a stricter test
+_CB_SPAN_BLIND_INTERIOR = 0.10   # fraction of valid pixels that must remain off both
+                                 # rails for median/span to carry information. Below
+                                 # it the reading is whatever narrow population
+                                 # survives between the rails, and it stops tracking
+                                 # the knobs at all. Calibrated on the two observed
+                                 # regimes: the 2026-08-23 frozen frames held a 2.4%
+                                 # interior and returned a bit-identical median/span
+                                 # across the whole contrast range and both rails,
+                                 # while the 2026-08-14 ep1 corner (20.1% interior,
+                                 # span 0.992) still tracked and must keep its
+                                 # offset-driven exemption. Note this is a stricter
+                                 # test than _CB_HARD_CLIP_FRACTION: a merely
+                                 # rail-dominated frame (30% pinned, 70% interior)
+                                 # has a perfectly readable span. Coupled to
+                                 # _CB_MIN_INTERIOR_FRACTION above: below that
+                                 # switch the median/span are measured over all
+                                 # valid pixels, not the interior, so this
+                                 # threshold judges two physically different
+                                 # readings on either side of it
 # Clip hysteresis: the field 2026-08-14 limit cycle was declip acting at exactly the
 # acceptance threshold while measurement noise straddled it (bclip 0.015-0.05 bounced
-# a declip/recenter tug-of-war for 10+ measurements). ACCEPT tolerates a small margin
-# over the user's clip limit (also ~where percentile pinning would begin to bias the
-# span reading); ACT fires only well above it. Readings inside the deadband neither
-# block acceptance nor trigger clip moves.
+# a declip/recenter tug-of-war for 10+ measurements). The accept margin tolerates a
+# small excess over the operator's clip limit (also ~where percentile pinning would begin
+# to bias the span reading); the act threshold fires only well above it. Readings
+# inside the deadband neither block acceptance nor trigger clip moves.
 _CB_CLIP_ACCEPT_MARGIN = 0.01
 _CB_CLIP_ACT_MARGIN = 0.04
 
 # Termination / verification.
-_CB_PATIENCE = 4                 # consecutive measurements with neither a best-cost
-                                 # improvement nor bracket progress -> lock best
-_CB_MIN_COST_IMPROVEMENT = 0.02  # improvement smaller than this is noise, not progress
-_CB_MAX_VERIFY_RETRIES = 2       # pooled-verify attempts before letting patience end it
-
-# Slope learning trust: a measured response smaller than these is inside the
-# 1-frame noise floor, so its SIGN is a coin flip -- _measured_slope would floor
-# the magnitude but keep the noise-determined sign, and a wrong-sign slope sends
-# every subsequent secant the wrong way (review finding, 2026-08-15). Responses
-# below the floor neither teach a slope nor contradict one.
-_CB_MIN_LEARN_MEDIAN = 0.08      # min |d median| to trust a brightness-slope sign
-_CB_MIN_LEARN_LOGSPAN = 0.10     # min |d log10 span| to trust a contrast-slope sign
-
-# Contrast bracket (the searched window on the dB knob).
-_CB_BRACKET_MIN_WIDTH = 0.01     # bracket narrower than this while still clipped means
-                                 # no usable window exists at this brightness
-_CB_BRACKET_B_DRIFT = 0.05       # a bracket endpoint is only valid while brightness is
-                                 # within this of where the endpoint was measured
-
-# Brightness secant jump cap: the knob is linear so a deadbeat jump is legitimate,
-# but cap it at a few base steps as anti-windup against a noise-corrupted slope.
-_CB_BRIGHTNESS_JUMP_CAP = 0.15
-
-# Contrast secant jump cap. The contrast slope is learned OPPORTUNISTICALLY from
-# clean same-brightness walk pairs (never from a dedicated probe, which saturates
-# on narrow-window tools). On a gentle plant the learned slope produces long,
-# legitimate jumps (a gspan~20dB tool needs most of the knob); on a harsh plant
-# the steep learned slope yields tiny steps naturally. The cap bounds the damage
-# of a floor-limited bogus slope to one recoverable overshoot (the bracket and
-# bisection absorb it).
-_CB_CONTRAST_JUMP_CAP = 0.3
-
-# cb_cost clip weights: white clipping saturates exactly the bright texture the
-# downstream top-hat energy measures; black pixels are background the top-hat removes
-# anyway. Weight white-clip excess above black accordingly.
+_CB_MAX_MEASURE_RECOVERIES = 3   # RTM recoveries (restart + re-measure) a single run may
+                                 # spend on failed measurements before it stops trying;
+                                 # failures beyond this still consume measurement budget
+                                 # (no early abort: a permanently failed RTM grinds to
+                                 # the budget and ends measure-failed)
+# cb_edge_cost clip weights: white clipping saturates exactly the bright texture
+# the downstream top-hat energy measures; black pixels are background the top-hat
+# removes anyway. Weight white-clip excess above black accordingly.
 _CB_COST_WHITE_CLIP_WEIGHT = 2.5
 _CB_COST_BLACK_CLIP_WEIGHT = 1.5
-
-
-def _balance_stalled(prev, cur, eps=_CB_STALL_EPS):
-    """True when a knob change produced no measurable movement in any balance metric."""
-    if prev is None or cur is None:
-        return False
-    return (abs(cur.white_clip - prev.white_clip) < eps
-            and abs(cur.black_clip - prev.black_clip) < eps
-            and abs(cur.median_fraction - prev.median_fraction) < eps
-            and abs(cur.span_fraction - prev.span_fraction) < eps)
-
-
 def compute_cb_balance(image, white_level, contrast_percentile=2.0):
     """
     Measure clipping/brightness balance of an image's valid pixels.
@@ -280,7 +221,7 @@ def compute_cb_balance(image, white_level, contrast_percentile=2.0):
 
     vmin = float(valid.min())
     vmax = float(valid.max())
-    # Clip fractions: over ALL valid pixels (the operator's clip budget).
+    # Clip fractions: over all valid pixels (the operator's clip budget).
     white_clip = float(numpy.count_nonzero(valid >= white_level) / n_valid)
     black_clip = float(numpy.count_nonzero(valid <= 0.0) / n_valid)
 
@@ -297,797 +238,688 @@ def compute_cb_balance(image, white_level, contrast_percentile=2.0):
     p_lo, p_hi = numpy.percentile(reg, [p, 100.0 - p])
     span_fraction = float((p_hi - p_lo) / white_level)
     return CBBalance(white_clip, black_clip, median_fraction, n_valid, vmin, vmax,
-                     span_fraction)
-
-
-def next_cb_step(balance, contrast, brightness, cfg):
-    """
-    Decide the next detector contrast/brightness from the current balance.
-
-    TWO damped-proportional servos run as one co-converging loop, GATED on clipping:
-
-      Brightness (detector offset) -> drives the median to target_median_fraction;
-      biased by any clip-limit excess so clipping is relieved first. Change is
-      proportional to the error, capped at brightness_step, so the step shrinks near
-      target and the loop converges instead of limit-cycling by a fixed step.
-
-      Contrast (detector gain) -> drives the robust occupied span (span_fraction) to
-      target_contrast_span, proportional and capped at contrast_step. It is only run
-      when NO rail is clipping, because a clipped rail pins a percentile and makes the
-      span reading a lie (it would race the brightness clip-relief into an oscillation).
-
-    Precedence each iteration:
-      P1  both rails clipped  -> brightness can't help; compress range (contrast - step).
-      P2  one rail  clipped   -> relieve with brightness; FREEZE contrast.
-      P3  no clipping         -> run BOTH servos (here span<->gain and median<->offset
-                                 are nearly independent, so they decouple and converge).
-
-    span_floor holds the contrast servo on a flat/degenerate field (span ~ 0), where
-    there is no real contrast to chase and the servo would otherwise slam the gain to
-    its cap amplifying noise.
-
-    :param balance: CBBalance from compute_cb_balance
-    :param contrast: current normalized contrast in [0, 1]
-    :param brightness: current normalized brightness in [0, 1]
-    :param cfg: CBControlConfig
-    :return: (new_contrast, new_brightness, converged)
-    """
-    white_over = balance.white_clip > cfg.max_white_clip
-    black_over = balance.black_clip > cfg.max_black_clip
-    median_err = cfg.target_median_fraction - balance.median_fraction  # +ve => too dark
-    median_off = abs(median_err) > cfg.median_tol
-
-    # The span reading is only trustworthy when nothing is pinned at a rail.
-    span_trustworthy = not white_over and not black_over
-    span_err = cfg.target_contrast_span - balance.span_fraction  # +ve => contrast too low
-    span_off = span_trustworthy and abs(span_err) > cfg.contrast_tol
-
-    # Balanced: within both clip limits, the median band, and (when trustworthy) the
-    # span band.
-    if not white_over and not black_over and not median_off and not span_off:
-        return contrast, brightness, True
-
-    new_c = contrast
-    new_b = brightness
-
-    if white_over and black_over:
-        # P1 -- histogram pinned at BOTH rails: brightness can't fix it -> compress.
-        new_c = contrast - cfg.contrast_step
-    elif white_over or black_over:
-        # P2 -- one rail clipped: relieve with brightness, freeze contrast (the span
-        # reading is a pinned-percentile artifact right now).
-        b_error = cfg.brightness_gain * median_err
-        if white_over:
-            b_error -= cfg.clip_gain * (balance.white_clip - cfg.max_white_clip)
-        if black_over:
-            b_error += cfg.clip_gain * (balance.black_clip - cfg.max_black_clip)
-        step = max(-cfg.brightness_step, min(cfg.brightness_step, b_error))
-        new_b = brightness + step
-    else:
-        # P3 -- no clipping: run both decoupled servos.
-        b_step = cfg.brightness_gain * median_err
-        b_step = max(-cfg.brightness_step, min(cfg.brightness_step, b_step))
-        new_b = brightness + b_step
-        # Contrast servo, with the degenerate-field guard.
-        if span_off and balance.span_fraction > cfg.span_floor:
-            c_step = cfg.contrast_gain * span_err
-            c_step = max(-cfg.contrast_step, min(cfg.contrast_step, c_step))
-            new_c = contrast + c_step
-
-    new_c = min(cfg.max_bound, max(cfg.min_bound, new_c))
-    new_b = min(cfg.max_bound, max(cfg.min_bound, new_b))
-    return new_c, new_b, False
-
-
+                     span_fraction, float(p_lo / white_level),
+                     float(p_hi / white_level))
 def cb_clip_acceptable(balance, cfg):
     """
-    True when both clip fractions are within the user limit plus the ACCEPT margin.
+    True when both clip fractions are within the operator limit plus the accept margin.
 
-    This is the acceptance-side clip test (used by cb_converged and the span-trust
-    decision in cb_cost). The margin exists because a 1-frame clip reading has noise
-    of the same order as the limit itself; the pooled verify measurement re-checks
-    any accepted point at lower noise.
+    This is the acceptance-side clip test (used by cb_edges_accepted). The
+    margin exists because a 1-frame clip reading has noise of the same order
+    as the limit itself; the pooled verify measurement re-checks any accepted
+    point at lower noise.
     """
     return (balance.white_clip <= cfg.max_white_clip + _CB_CLIP_ACCEPT_MARGIN
             and balance.black_clip <= cfg.max_black_clip + _CB_CLIP_ACCEPT_MARGIN)
 
 
+def cb_clips_actionable(white_clip, black_clip, cfg):
+    """
+    The clip-actionable test on raw fractions, for callers holding clip numbers
+    without a CBBalance (a persisted telemetry row, a commit-check summary).
+
+    :param white_clip: fraction of valid pixels pinned at the ceiling
+    :param black_clip: fraction of valid pixels pinned at the floor
+    :param cfg: CBEdgeConfig
+    :return: bool
+    """
+    return (white_clip > cfg.max_white_clip + _CB_CLIP_ACT_MARGIN
+            or black_clip > cfg.max_black_clip + _CB_CLIP_ACT_MARGIN)
+
+
 def cb_clip_actionable(balance, cfg):
     """
-    True when either clip fraction is far enough over the user limit that a clip-
-    relief move should fire. Readings between ACCEPT and ACT are a deadband: not
-    accepted as converged-clean, but not worth chasing either (the 2026-08-14 field
-    limit cycle lived entirely inside that band).
+    True when either clip fraction is far enough over the operator limit that a clip-
+    relief move should fire. Readings between the accept and act margins are a
+    deadband: not accepted as converged-clean, but not worth chasing either (the
+    2026-08-14 field limit cycle lived entirely inside that band).
     """
-    return (balance.white_clip > cfg.max_white_clip + _CB_CLIP_ACT_MARGIN
-            or balance.black_clip > cfg.max_black_clip + _CB_CLIP_ACT_MARGIN)
+    return cb_clips_actionable(balance.white_clip, balance.black_clip, cfg)
 
 
-def cb_cost(balance, cfg):
+def cb_rail_dominated_clips(white_clip, black_clip):
     """
-    Scalar "badness" of a measured balance, for best-so-far selection (lower = better).
+    The rail-dominance test on raw fractions (see cb_rail_dominated), for
+    callers holding clip numbers without a CBBalance.
 
-    A static one-shot calibration must lock the lowest-cost CB it actually measured,
-    not whatever the final iteration wrote. Terms:
-      - median error vs target,
-      - span error vs target; when a clipped rail taints the reading (a pinned
-        percentile can fake an on-target span) a pessimistic penalty is ADDED to
-        the term (additive since v3.3.8; the old floor made every tainted span
-        term identical, collapsing clipped candidates' ordering to median error
-        alone) -- dropping it entirely made clipped baselines artificially
-        cheap and let them win best-so-far over clean, nearly-converged points,
-      - clipping BEYOND the user's limit; white excess is weighted above black
-        because saturation destroys exactly the bright texture the downstream
-        top-hat energy measures, while black pixels are background it removes.
-
-    :param balance: CBBalance from compute_cb_balance
-    :param cfg: CBControlConfig
-    :return: non-negative float; 0.0 means on every target with no excess clipping
+    :param white_clip: fraction of valid pixels pinned at the ceiling
+    :param black_clip: fraction of valid pixels pinned at the floor
+    :return: bool
     """
-    m_err = abs(cfg.target_median_fraction - balance.median_fraction)
-    white_excess = max(0.0, balance.white_clip - cfg.max_white_clip)
-    black_excess = max(0.0, balance.black_clip - cfg.max_black_clip)
-    span_trust = cb_clip_acceptable(balance, cfg)
-    raw_s_err = abs(cfg.target_contrast_span - balance.span_fraction)
-    # Tainted span: ADD the pessimistic penalty instead of flooring at it, so
-    # two clipped candidates still order by their real span error (the floor
-    # made every tainted span term identical, collapsing their ordering to
-    # median error alone -- part of the 2026-08-20 dark-lock preference).
-    s_err = raw_s_err if span_trust else raw_s_err + _CB_TAINTED_SPAN_PENALTY
-    return (m_err + s_err + _CB_COST_WHITE_CLIP_WEIGHT * white_excess
-            + _CB_COST_BLACK_CLIP_WEIGHT * black_excess)
+    return max(white_clip, black_clip) >= _CB_HARD_CLIP_FRACTION
 
 
-# ===========================
-# Bracket -> bisect calibration (side-classification control)
-# ===========================
-#
-# The contrast knob is logarithmic -- the SDK defines it as "contrast voltage
-# converted to decibels then normalized", and the measured pixel span scales with
-# the *linear* gain, so span-vs-knob is exponential. On some tools (2026-08-14
-# field campaign, Hydra) the entire usable window between an all-black and an
-# all-white image is ~0.03-0.05 knob units -- NARROWER than any safe fixed probe
-# perturbation, so slope-probing the contrast knob saturates the image and
-# measures nothing. The orchestrator below therefore never estimates a contrast
-# slope: it classifies each measurement by SIDE (gain too high / too low / in
-# window), brackets the window geometrically, and bisects in knob space -- over a
-# window that narrow the dB/linear distinction is irrelevant, and side
-# classification of a hard-clipped frame is nearly immune to measurement noise.
-# Brightness is a ~linear volt offset; its median slope IS measured (from the
-# run's own moves) and used for a capped linear secant.
-#
-#   contrast_delta   : SEED step of the contrast bracket walk (grows x2 per
-#                      consecutive same-direction move, so any window width is
-#                      reached in logarithmic time; per-tool learned values can
-#                      be passed here to start pre-adapted).
-#   brightness_delta : first brightness move when no median slope is known yet
-#                      (the move doubles as the probe).
-#   slope_floor_brightness : minimum trusted |d(median)/d(brightness)|; guards a
-#                      quantized difference from exploding the secant step.
-#   slope_floor_contrast : retained for config compatibility (no contrast slope
-#                      is estimated anymore).
-#   min_knob_delta   : a brightness change must be at least this large for a
-#                      measured slope to be trusted.
-#   initial_k_brightness / initial_k_contrast : optional slope SEEDS learned from
-#                      a previous run on the same tool (both slopes are plant
-#                      properties, independent of the scene: d(median)/d(b) = the
-#                      offset gain, d(log10 span)/d(c) = the dB/knob mapping).
-#                      The run's own measurements overwrite them as soon as a
-#                      trustworthy pair exists, so a stale seed costs at most one
-#                      capped, bracket-clamped jump.
-CBProbeConfig = namedtuple(
-    "CBProbeConfig",
-    ["contrast_delta", "brightness_delta", "slope_floor_contrast",
-     "slope_floor_brightness", "min_knob_delta",
-     "initial_k_brightness", "initial_k_contrast"],
-    defaults=[None, None],
+def cb_interior_fraction(balance):
+    """
+    Fraction of valid pixels sitting off both rails -- the population the median
+    and span are actually measured over (compute_cb_balance's ``interior``).
+
+    :param balance: CBBalance
+    :return: float in [0, 1]
+    """
+    return max(0.0, 1.0 - balance.white_clip - balance.black_clip)
+
+
+def cb_span_blind(balance):
+    """
+    True when too little of the frame is off the rails for the median/span
+    readings to carry information about the detector state.
+
+    A clipped frame's median and span are computed over whatever survives between
+    the rails. Squeeze that interior small enough and the readings stop being a
+    measurement of the scene at all: on 2026-08-23 a 97.6%-white frame (2.4%
+    interior) reported a bit-identical median 0.8824 / span 0.2395 at contrast
+    0.657, 0.621, 0.550 and 0.122 -- and reported the same pair when the frame
+    flipped to 97.5% black. Only the clip fractions moved.
+
+    Callers that arbitrate on span must consult this first, or they will read a
+    frozen constant as evidence. Note this is a stricter test than
+    cb_rail_dominated: a frame with one rail at 30% still has a 70% interior and
+    a perfectly usable span.
+
+    :param balance: CBBalance, or None
+    :return: bool (False for None -- nothing measured, nothing to judge)
+    """
+    if balance is None:
+        return False
+    return cb_interior_fraction(balance) < _CB_SPAN_BLIND_INTERIOR
+
+
+def cb_rail_dominated(balance):
+    """
+    True when one rail dominates the frame -- at least _CB_HARD_CLIP_FRACTION of
+    the valid pixels are pinned at the ceiling or the floor.
+
+    Such a frame is deterministic: the pinned pixels sit at exactly the rail, so
+    consecutive frames -- and small knob changes that leave the frame pinned --
+    reproduce the same pixel statistics bit for bit. Any caller that infers "the
+    RTM buffer did not refresh" from identical statistics must exempt these
+    frames. (2026-08-23: a 99.1%-white-railed scene was rejected as a frozen
+    buffer on the very first declip step, aborting the whole calibration and
+    locking the saturated detector.)
+
+    The search relies on the same determinism from the other side: it walks
+    geometrically precisely so bit-identical railed frames cannot stall it.
+
+    :param balance: CBBalance, or None
+    :return: bool (False for None -- nothing measured, nothing to exempt)
+    """
+    if balance is None:
+        return False
+    return cb_rail_dominated_clips(balance.white_clip, balance.black_clip)
+# Escape tuning. The escape is a retreat relative to the pinning rail, with
+# steps that grow geometrically, rather than a jump to a fixed "safe" anchor
+# point: a safe-anchor design failed the 2026-08-14 fitted plants, whose
+# usable windows sit elsewhere.
+_CB_ESCAPE_SEED = 0.05       # first escape step (both knobs)
+_CB_ESCAPE_CAP = 0.40        # escalation ceiling
+# Default knob slopes when no per-tool value is persisted. The signs are
+# physics, not tuning: more gain widens the spread, more offset brightens
+# the midpoint, on every detector. The magnitudes sit deliberately at the
+# harsh end of everything measured: a too-high default only undershoots --
+# small safe steps that _learn refines within a move or two -- while a
+# too-low one overshoots straight into a rail (the ep8 replay saturated
+# from a near-target start on modest defaults). k_c: the fitted harsh
+# (Hydra) plant's true slope is gspan/20 = 12 decades/knob, and the
+# on-tool learned values were 12.31 and 11.89. The "Hydra k_c ~2-6.5"
+# figures the old 6.0 default was read from were lower bounds from
+# clip-suppressed probes, not slope estimates (the field probes measured
+# >= 6.6-8.5 decades/knob with the response flattened by clipping), so
+# 6.0 sat below even the lower bound -- violating this comment's own
+# harsh-end rule: every solve from a narrow-span baseline overshot the
+# ~0.04-knob usable window into a rail (ep2 / PlantSweep gspan >= 240,
+# 2026-08-26). A sign error -- the failure class behind field Run-4's
+# stale-slope jumps to zero gain -- is impossible here by construction.
+_CB_DEFAULT_K_C = 12.0       # d log10(spread) / d contrast
+_CB_DEFAULT_K_B = 8.0        # d midpoint / d brightness
+_CB_LEARN_TRUST = 0.03       # min |response| to refine a slope from a move:
+                             # below it the sign is a coin flip of 1-frame
+                             # noise (review lesson, 2026-08-15), so such a
+                             # response neither teaches a slope nor
+                             # contradicts one
+_CB_STEP_CAP_C = 0.30        # anti-windup caps on one solve iteration;
+_CB_STEP_CAP_B = 0.25        # halved per knob when a move lands on a rail
+_CB_STEP_CAP_MIN = 0.01      # (the 2026-08-14 plants' usable window is
+                             # narrower than any safe fixed step -- the
+                             # campaign's core lesson), floored here
+_CB_EDGE_TOL_DEFAULT = 0.12  # per-edge acceptance half-width; sits well
+                             # above 1-frame edge noise (the 2026-08-14
+                             # campaign died on gates at ~1 sigma of noise)
+_CB_SPREAD_FLOOR = 0.02      # below this the image is flat; heavily penalized
+_CB_FLAT_PENALTY = 1.0       # a flat image must never win "best" (field
+                             # Run-2 locked contrast 0.0 on a cost tie-break)
+
+# Public alias for run_metadata (the worker records the acceptance
+# tolerance so traces stay interpretable).
+CB_EDGE_TOL_DEFAULT = _CB_EDGE_TOL_DEFAULT
+
+CBEdgeConfig = namedtuple(
+    "CBEdgeConfig",
+    ["white_level", "margin_lo", "margin_hi", "max_white_clip",
+     "max_black_clip", "min_bound", "max_bound", "edge_tol"],
+    defaults=[_CB_EDGE_TOL_DEFAULT],
 )
 
-# Outcome of one calibration run. `contrast`/`brightness` is the CB to lock (the
-# lowest-cost point measured, or the accepted point); `status` is a short tag.
-# `plant` reports what the run LEARNED about this tool's response (measured
-# brightness slope, the bracketed contrast window) so the worker can persist it
-# per-microscope and seed the next run -- the controller never assumes a plant,
-# it discovers one, and this is how the discovery carries across runs/tools.
+# Outcome of run_cb_correction. best_clean is the lowest-cost clip-clean
+# measured point as (contrast, brightness) or None -- the worker's
+# commit-check revert target when the committed point turns out clipped.
 CBResult = namedtuple(
     "CBResult",
-    ["contrast", "brightness", "converged", "cost", "n_measurements", "status",
-     "plant", "best_clean"],
-    # best_clean: (contrast, brightness) of the lowest-cost measurement whose
-    # clips were NOT actionable, or None if no such point was measured. The
-    # worker's commit check reverts to it instead of blindly to the start.
-    defaults=[None, None],
+    ["contrast", "brightness", "converged", "cost", "n_measurements",
+     "status", "plant", "best_clean"],
 )
 
 
-def _clamp(value, lo, hi):
-    return min(hi, max(lo, value))
+def _cb_edges(bal):
+    """The robust histogram edges of a balance, as fractions of full scale.
+
+    Falls back to median +- span/2 for fixtures that construct CBBalance
+    without the appended edge fields, clamped into [0, 1] -- the fallback
+    can otherwise place an edge outside the physical range and fabricate
+    edge error."""
+    if bal.p2_fraction is not None and bal.p98_fraction is not None:
+        return bal.p2_fraction, bal.p98_fraction
+    half = bal.span_fraction / 2.0
+    return (max(0.0, bal.median_fraction - half),
+            min(1.0, bal.median_fraction + half))
 
 
-def cb_converged(balance, cfg):
+def cb_edge_cost(balance, cfg):
+    """Distance from the edge targets, plus clip excess (white weighted above
+    black -- saturation destroys the texture the analysis measures) and a
+    flat-image penalty so a zero-spread point can never outrank a moderately
+    clipped one."""
+    lo, hi = _cb_edges(balance)
+    cost = abs(lo - cfg.margin_lo) + abs(hi - (1.0 - cfg.margin_hi))
+    cost += _CB_COST_WHITE_CLIP_WEIGHT * max(
+        0.0, balance.white_clip - cfg.max_white_clip)
+    cost += _CB_COST_BLACK_CLIP_WEIGHT * max(
+        0.0, balance.black_clip - cfg.max_black_clip)
+    if (hi - lo) < _CB_SPREAD_FLOOR:
+        cost += _CB_FLAT_PENALTY
+    return cost
+
+
+def cb_edges_accepted(balance, cfg, slack=1.0):
+    """True when both edges sit within edge_tol of their targets and the clip
+    fractions are inside the operator limits plus the accept margin.
+
+    ``slack`` scales the edge tolerance; the verify re-check uses a slightly
+    looser band so measurement noise on a borderline point cannot flicker
+    accept/verify pairs for the rest of the budget."""
+    lo, hi = _cb_edges(balance)
+    tol = cfg.edge_tol * slack
+    return (abs(lo - cfg.margin_lo) <= tol
+            and abs(hi - (1.0 - cfg.margin_hi)) <= tol
+            and balance.white_clip
+            <= cfg.max_white_clip + _CB_CLIP_ACCEPT_MARGIN
+            and balance.black_clip
+            <= cfg.max_black_clip + _CB_CLIP_ACCEPT_MARGIN)
+
+
+def run_cb_correction(measure_at, contrast, brightness, cfg, budget,
+                      note=None, verify_at=None, recover=None,
+                      init_k_contrast=None, init_k_brightness=None):
     """
-    True when a balance is ACCEPTABLE: clip within the user limits plus the accept
-    margin, and median/span inside their bands around the targets.
+    Edge-margin detector correction: escape saturation, then solve.
 
-    The bands are cfg.median_tol / cfg.contrast_tol, which the worker now ships
-    WIDE (0.20 / 0.25): the downstream consumers (rescaling filter, top-hat energy,
-    scale-invariant matcher) need usable dynamic range, not an exact histogram, and
-    the old 1-sigma point gates were statistically unreachable under real
-    measurement noise -- 8 of 9 field episodes ended budget-exhausted chasing them.
+    :param measure_at: callable (contrast, brightness) -> (CBBalance | None,
+        applied_contrast, applied_brightness); one measurement per call
+    :param contrast, brightness: current knob positions (normalized)
+    :param cfg: CBEdgeConfig
+    :param budget: max measurements, verify included
+    :param note: optional callable(str) for operator-readable progress
+    :param verify_at: pooled-measure callable with measure_at's signature,
+        used to confirm acceptance (defaults to measure_at)
+    :param recover: optional callable() that restarts the RTM after a failed
+        measurement (one retry per failure, bounded per run)
+    :param init_k_contrast: seed for d log10(spread) / d contrast (per-tool,
+        persisted); probed when absent
+    :param init_k_brightness: seed for d midpoint / d brightness
+    :return: CBResult -- converged=True only after a verified acceptance;
+        otherwise the lowest-cost measured point with an honest status
     """
-    if not cb_clip_acceptable(balance, cfg):
-        return False
-    median_off = abs(cfg.target_median_fraction - balance.median_fraction) > cfg.median_tol
-    span_off = abs(cfg.target_contrast_span - balance.span_fraction) > cfg.contrast_tol
-    return not median_off and not span_off
-
-
-def secant_step(stat, target, knob, slope, step_cap, lo, hi, log_space=False):
-    """
-    One deadbeat/secant move of a single knob to drive ``stat`` toward ``target``.
-
-    ``slope`` is the locally-measured sensitivity d(stat)/d(knob), or -- when
-    ``log_space`` -- d(log10 stat)/d(knob), which is the right coordinate for the dB
-    contrast knob (linear gain, and therefore span, is exponential in the knob). The
-    step is capped at ``step_cap`` (anti-windup) and clamped to [lo, hi]. Returns
-    ``knob`` unchanged when the move is undefined (zero slope; non-positive stat/target
-    in log space).
-    """
-    if slope == 0.0:
-        return knob
-    if log_space:
-        if stat <= 0.0 or target <= 0.0:
-            return knob
-        err = math.log10(target) - math.log10(stat)
-    else:
-        err = target - stat
-    step = _clamp(err / slope, -step_cap, step_cap)
-    return _clamp(knob + step, lo, hi)
-
-
-def _measured_slope(stat0, stat1, knob0, knob1, log_space, floor, min_knob_delta):
-    """
-    Estimate d(stat)/d(knob) (or d(log10 stat)/d(knob)) from two measured points, or
-    None when untrustworthy. Returns None if the knobs are too close to divide safely
-    (an 8-bit-quantized difference would be noise-dominated). Otherwise floors the
-    magnitude at ``floor`` (keeping sign) so a near-zero measured slope can't explode a
-    deadbeat step.
-    """
-    dk = knob1 - knob0
-    if abs(dk) < min_knob_delta:
-        return None
-    if log_space:
-        if stat0 <= 0.0 or stat1 <= 0.0:
-            return None
-        dstat = math.log10(stat1) - math.log10(stat0)
-    else:
-        dstat = stat1 - stat0
-    slope = dstat / dk
-    if slope == 0.0:
-        return None
-    return math.copysign(max(abs(slope), floor), slope)
-
-
-def _signed_probe_delta(knob, delta, lo, hi):
-    """Pick a probe perturbation that stays inside [lo, hi] (probe inward near a bound)."""
-    if knob + delta <= hi:
-        return delta
-    if knob - delta >= lo:
-        return -delta
-    up, down = hi - knob, knob - lo
-    return up if up >= down else -down
-
-
-def run_cb_calibration(measure_at, contrast, brightness, cfg, probe, budget,
-                       note=None, verify_at=None):
-    """
-    One-shot detector contrast/brightness calibration: classify -> cure/bracket ->
-    bisect -> brightness secant -> band-accept (pooled verify), locking the
-    lowest-cost CB actually measured when no point is accepted.
-
-    Strategy (see the section comment above CBProbeConfig for the physics):
-
-      1. accept immediately when the current balance is in band -- confirmed with
-         one pooled ``verify_at`` measurement when provided;
-      2. cure rail-dominated states by the field-hardened rule table
-         (offset-driven white -> brightness down; gain-driven white -> contrast
-         down; black -> brightness up), stepping geometrically so bit-identical
-         frames cannot stall the walk;
-      3. record every measurement as contrast-bracket evidence ("gain too high" /
-         "gain too low") and BISECT the knob-space bracket once both sides exist
-         at the current brightness -- the bracket endpoints double as visited-
-         state memory, so ping-ponging between the same two points is
-         structurally impossible;
-      4. recenter the median with a measured-slope linear secant on brightness
-         (the slope is learned from the run's own moves; the first move doubles
-         as the probe);
-      5. terminate on acceptance, on patience (no cost improvement and no bracket
-         progress for _CB_PATIENCE measurements -> lock best-so-far), or on
-         budget exhaustion.
-
-    Pure orchestration -- all hardware I/O is behind ``measure_at``/``verify_at``
-    so this runs in tests against a synthetic detector. ``measure_at(c, b)`` must
-    apply the CB, settle, and return ``(CBBalance | None, c_applied, b_applied)``;
-    the applied values may differ from the request if the detector clamps them,
-    and the orchestrator tracks the applied values as the true knob position.
-    ``verify_at`` has the same contract but should pool more frames (lower
-    noise); when provided, every acceptance is re-confirmed through it and the
-    verify measurement counts against the budget.
-
-    :param measure_at: callable(c, b) -> (CBBalance | None, c_applied, b_applied)
-    :param contrast: starting normalized contrast in [0, 1]
-    :param brightness: starting normalized brightness in [0, 1]
-    :param cfg: CBControlConfig (targets / bands / clip limits / bounds)
-    :param probe: CBProbeConfig (walk seed + brightness probe/slope trust)
-    :param budget: max number of measurements (== cb_max_iterations), verify incl.
-    :param note: optional callable(str) for progress logging
-    :param verify_at: optional pooled-frames measurement callable (same contract)
-    :return: CBResult (``.plant`` reports the learned tool response)
-    """
-    lo, hi = cfg.min_bound, cfg.max_bound
-    budget = max(1, int(budget))
-    span_lo_band = cfg.target_contrast_span - cfg.contrast_tol
-    span_hi_band = cfg.target_contrast_span + cfg.contrast_tol
-    seed_c = max(1e-3, probe.contrast_delta)
-
-    def _finite_or_none(value):
-        # A persisted seed can be hand-edited or corrupted into NaN/Infinity
-        # (json accepts them); a non-finite slope makes every secant degenerate.
-        return value if (value is not None and math.isfinite(value)) else None
-
+    lo_b, hi_b = cfg.min_bound, cfg.max_bound
+    verify = verify_at if verify_at is not None else measure_at
     state = {
-        "c": contrast, "b": brightness, "n": 0, "bal": None,
+        "c": contrast, "b": brightness, "bal": None, "n": 0,
+        "k_c": (init_k_contrast if init_k_contrast is not None
+                and init_k_contrast > 0 else _CB_DEFAULT_K_C),
+        "k_b": (init_k_brightness if init_k_brightness is not None
+                and init_k_brightness > 0 else _CB_DEFAULT_K_B),
+        "k_c_learned": False, "k_b_learned": False,
+        "k_c_contradicted": False, "k_b_contradicted": False,
         "best_cost": float("inf"), "best_c": contrast, "best_b": brightness,
-        "best_actionable": False,       # clips at the raw cost-argmin were actionable
-        "best_wclip": None, "best_bclip": None,
-        # Lowest-cost point whose clips were NOT actionable. Locking a clipped
-        # cost-argmin at patience only feeds the commit check a point it will
-        # revert (2026-08-20: an infeasible target-median/black-clip pair made
-        # the argmin a bclip=0.14 point every session).
-        "best_clean_cost": float("inf"), "best_clean_c": None, "best_clean_b": None,
-        "k_b": _finite_or_none(probe.initial_k_brightness),
-        "k_c": _finite_or_none(probe.initial_k_contrast),
-        "k_b_learned": False,           # True once THIS run measured the slope
-        "k_c_learned": False,
-        "k_b_contradicted": False,      # a seed was invalidated by a measured
-                                        # opposite-sign response (poison marker)
-        "c_lo": None, "c_lo_b": None,   # highest gain-too-low contrast (+ its b)
-        "c_hi": None, "c_hi_b": None,   # lowest gain-too-high contrast (+ its b)
-        "b_rail_free": None,            # last brightness whose frame was not rail-dominated
-        "esc_c": seed_c, "esc_b": cfg.brightness_step,
-        "last_c_dir": 0, "last_b_dir": 0,
-        "since_improve": 0, "verify_fails": 0, "span_tries": 0,
-        "best_excess": float("inf"),    # least total clip excess seen (progress)
-        "prev": None,                   # (bal, c, b) of the latest measurement
-        "before": None,                 # (bal, c, b) of the one before it
+        "best_actionable": False,
+        "best_clean_cost": float("inf"), "best_clean": None,
+        "measure_fails": 0, "recoveries": 0, "last_good": None,
+        "cap_c": _CB_STEP_CAP_C, "cap_b": _CB_STEP_CAP_B,
+        "esc": _CB_ESCAPE_SEED, "esc_dir": 0.0,
+        "last_dc": 0.0, "last_db": 0.0,  # the applied deltas of the last
+                                         # move, for causal rail attribution
+        "last_rail": 0.0,                # the rail the last relief fled
+        "acc_db": 0.0, "acc_dmid": 0.0,  # sub-trust brightness residual
+                                         # accumulators (see _learn)
     }
 
     def _plant():
-        # Report only what THIS run measured: echoing a seed back would let a
-        # wrong persisted slope survive forever (it gets re-persisted verbatim
-        # and re-seeded on every subsequent run on that tool).
-        window = None
-        if state["c_lo"] is not None and state["c_hi"] is not None:
-            window = (state["c_lo"], state["c_hi"])
-        return {"k_brightness": state["k_b"] if state["k_b_learned"] else None,
-                "k_contrast": state["k_c"] if state["k_c_learned"] else None,
-                "k_brightness_contradicted": state["k_b_contradicted"],
-                "c_window": window}
+        # Report only what this run measured: echoing a seed back would let
+        # a wrong persisted slope survive forever.
+        return {
+            "k_brightness": state["k_b"] if state["k_b_learned"] else None,
+            "k_contrast": state["k_c"] if state["k_c_learned"] else None,
+            "k_brightness_contradicted": state["k_b_contradicted"],
+            "k_contrast_contradicted": state["k_c_contradicted"],
+        }
 
-    def _bracket_update(bal, c, b):
-        """Classify a measurement as gain-too-high / gain-too-low evidence and
-        tighten the contrast bracket. Returns True when an endpoint moved."""
-        w_act = bal.white_clip > cfg.max_white_clip + _CB_CLIP_ACT_MARGIN
-        b_act = bal.black_clip > cfg.max_black_clip + _CB_CLIP_ACT_MARGIN
-        hard_w = bal.white_clip >= _CB_HARD_CLIP_FRACTION
-        hard_b = bal.black_clip >= _CB_HARD_CLIP_FRACTION
-        span = bal.span_fraction
-        # A hard-white frame whose readable interior span already FITS the target
-        # is offset-driven -- the gain is not the culprit, so it must not become
-        # gain-too-high evidence (it would poison the bracket).
-        offset_white = cfg.span_floor < span <= cfg.target_contrast_span
-        too_high = ((hard_w and not offset_white and not hard_b)
-                    or (w_act and not b_act and span > cfg.target_contrast_span)
-                    or (not w_act and not b_act and span > span_hi_band))
-        # Symmetrically, hard black with a READABLE span is offset territory; only
-        # a collapsed span marks the gain itself as too low. Clean below-band span
-        # (including a collapsed one) is direct too-low evidence.
-        too_low = ((hard_b and span <= cfg.span_floor)
-                   or (not w_act and not b_act and span < span_lo_band))
-        changed = False
-        if too_high and (state["c_hi"] is None or c < state["c_hi"]):
-            state["c_hi"], state["c_hi_b"] = c, b
-            changed = True
-        if too_low and (state["c_lo"] is None or c > state["c_lo"]):
-            state["c_lo"], state["c_lo_b"] = c, b
-            changed = True
-        return changed
-
-    def _bracket():
-        """The contrast bracket, valid only near the brightness it was measured
-        at (a brightness move shifts which gains clip). Crossed endpoints (noise
-        or drift artifacts) clear the bracket rather than mislead the bisect."""
-        c_lo, c_hi = state["c_lo"], state["c_hi"]
-        if c_lo is None or c_hi is None:
-            return None
-        if (abs(state["b"] - state["c_lo_b"]) > _CB_BRACKET_B_DRIFT
-                or abs(state["b"] - state["c_hi_b"]) > _CB_BRACKET_B_DRIFT):
-            return None
-        if c_hi <= c_lo:
-            state["c_lo"] = state["c_hi"] = None
-            state["c_lo_b"] = state["c_hi_b"] = None
-            return None
-        return c_lo, c_hi
+    def _result(status, converged=False):
+        c, b, cost = state["best_c"], state["best_b"], state["best_cost"]
+        if state["best_actionable"] and state["best_clean"] is not None:
+            # Never lock a point the worker's commit check can only revert.
+            c, b = state["best_clean"]
+            cost = state["best_clean_cost"]
+            status = f"{status}-infeasible"
+            if note is not None:
+                note("Auto CB infeasible: the lowest-cost point is actionably "
+                     "clipped - the margins conflict with the clip limits on "
+                     "this scene; locking the best clip-clean point instead")
+        if (status != "no-measure" and state["measure_fails"]
+                and state["measure_fails"] * 2 >= state["n"]):
+            # A failed baseline keeps its distinct "no-measure" status: the
+            # worker skips the whole commit path on it (nothing was measured,
+            # so there is nothing to lock), and this majority-failed override
+            # used to rewrite it to "measure-failed" at n=1, leaving that
+            # skip unreachable.
+            status = "measure-failed"
+        return CBResult(c, b, converged, cost, state["n"], status, _plant(),
+                        state["best_clean"])
 
     def take(c_req, b_req, tag, measure=None):
         measure = measure_at if measure is None else measure
         bal, c_app, b_app = measure(c_req, b_req)
+        if (bal is None and recover is not None
+                and state["recoveries"] < _CB_MAX_MEASURE_RECOVERIES):
+            state["recoveries"] += 1
+            recover()
+            bal, c_app, b_app = measure(c_req, b_req)
         state["n"] += 1
-        prev = state["prev"]
-        state["before"] = prev          # the measurement preceding the current one
-        state["prev"] = (bal, c_app, b_app)
+        prev = (state["bal"], state["c"], state["b"])
+        state["last_dc"] = c_app - state["c"]
+        state["last_db"] = b_app - state["b"]
         state["c"], state["b"], state["bal"] = c_app, b_app, bal
         if bal is None:
-            return None
-        cost = cb_cost(bal, cfg)
-        progressed = cost < state["best_cost"] - _CB_MIN_COST_IMPROVEMENT
+            state["measure_fails"] += 1
+            if state["last_good"] is not None:
+                g_bal, g_c, g_b = state["last_good"]
+                state["c"], state["b"], state["bal"] = g_c, g_b, g_bal
+            return None, prev
+        if not cb_span_blind(bal) and not cb_rail_dominated(bal):
+            # Only a readable frame is worth rewinding to -- a blind or
+            # rail-dominated one carries no trustworthy spread, and letting
+            # it overwrite this slot disabled the rewind entirely (every
+            # post-overshoot frame became its own "last good").
+            state["last_good"] = (bal, c_app, b_app)
+        cost = cb_edge_cost(bal, cfg)
+        actionable = cb_clip_actionable(bal, cfg)
         if cost < state["best_cost"]:
             state["best_cost"] = cost
             state["best_c"], state["best_b"] = c_app, b_app
-            state["best_actionable"] = cb_clip_actionable(bal, cfg)
-            state["best_wclip"], state["best_bclip"] = bal.white_clip, bal.black_clip
-        if (not cb_clip_actionable(bal, cfg)
-                and cost < state["best_clean_cost"]):
+            state["best_actionable"] = actionable
+        if not actionable and cost < state["best_clean_cost"]:
             state["best_clean_cost"] = cost
-            state["best_clean_c"], state["best_clean_b"] = c_app, b_app
-        # Rail-clearing IS progress even while the cost hovers (deep-clip cures
-        # trade rails for several moves before the cost term can fall).
-        excess = (max(0.0, bal.white_clip - cfg.max_white_clip)
-                  + max(0.0, bal.black_clip - cfg.max_black_clip))
-        if excess < state["best_excess"] - 0.05:
-            progressed = True
-        state["best_excess"] = min(state["best_excess"], excess)
-        stalled = (prev is not None and prev[0] is not None
-                   and _balance_stalled(prev[0], bal))
-        # Bracket evidence is recorded even from a bit-identical frame (a lower
-        # contrast that is STILL pinned white genuinely tightens c_hi), but a
-        # stalled frame must not count as PROGRESS: the review's offset-overload
-        # replay showed a contrast flail through identical pinned frames
-        # resetting patience on every step and structurally disabling the stop.
-        if _bracket_update(bal, c_app, b_app) and not stalled:
-            progressed = True   # structural progress even when cost got worse
-        state["since_improve"] = 0 if progressed else state["since_improve"] + 1
-        if progressed:
-            # A materially better state means the cure is close: stop sprinting.
-            # (The brightness ladder otherwise kept doubling past a near-good
-            # landing -- ep1 replay overshot b 0.432 -> 0.832 into full white.)
-            state["esc_b"] = cfg.brightness_step
-        if max(bal.white_clip, bal.black_clip) < _CB_HARD_CLIP_FRACTION:
-            # Remember a brightness at which the image was NOT rail-dominated:
-            # the offset-bisection cure homes on it when a later frame is
-            # fully pinned by the offset.
-            state["b_rail_free"] = b_app
-        if prev is not None and prev[0] is not None:
-            p_bal, p_c, p_b = prev
-            d_median = bal.median_fraction - p_bal.median_fraction
-            d_b = b_app - p_b
-            if abs(c_app - p_c) < 1e-9 and abs(d_b) >= probe.min_knob_delta:
-                # Pure-brightness move. A response above the sign-trust floor
-                # that CONTRADICTS the current slope invalidates it (a stale or
-                # noise-flipped seed would otherwise send every jump the wrong
-                # way forever -- no pair in that failure loop is ever clean
-                # enough to re-learn through the gate below).
-                if (state["k_b"] is not None
-                        and abs(d_median) >= _CB_MIN_LEARN_MEDIAN
-                        and (d_median > 0) != (state["k_b"] * d_b > 0)):
-                    state["k_b"] = None
-                    state["k_b_learned"] = False
-                    state["k_b_contradicted"] = True
-                # Learn only between states where no rail DOMINATES (rail
-                # migration fakes wrong-sign slopes) AND the response clears
-                # the sign-trust floor (below it the sign is noise).
-                rail_free = (max(p_bal.white_clip, p_bal.black_clip)
-                             < _CB_HARD_CLIP_FRACTION
-                             and max(bal.white_clip, bal.black_clip)
-                             < _CB_HARD_CLIP_FRACTION)
-                if rail_free and abs(d_median) >= _CB_MIN_LEARN_MEDIAN:
-                    k = _measured_slope(p_bal.median_fraction, bal.median_fraction,
-                                        p_b, b_app, log_space=False,
-                                        floor=probe.slope_floor_brightness,
-                                        min_knob_delta=probe.min_knob_delta)
-                    if k is not None:
-                        state["k_b"] = k
-                        state["k_b_learned"] = True
-            # Learn the contrast slope (d log10 span / dc) from a clean
-            # same-brightness pair -- the walk's own measurements, never a
-            # dedicated probe. Clean-only: a pinned percentile fakes the span.
-            if (abs(b_app - p_b) < 1e-9
-                    and not cb_clip_actionable(p_bal, cfg)
-                    and not cb_clip_actionable(bal, cfg)
-                    and p_bal.span_fraction > cfg.span_floor
-                    and bal.span_fraction > cfg.span_floor
-                    and abs(math.log10(bal.span_fraction)
-                            - math.log10(p_bal.span_fraction))
-                    >= _CB_MIN_LEARN_LOGSPAN):
-                k = _measured_slope(p_bal.span_fraction, bal.span_fraction,
-                                    p_c, c_app, log_space=True,
-                                    floor=probe.slope_floor_contrast,
-                                    min_knob_delta=probe.min_knob_delta)
-                if k is not None:
-                    state["k_c"] = k
-                    state["k_c_learned"] = True
-            # A brightness move that changed nothing (deep-black terrain) grows
-            # the ladder step; the contrast walk grows itself geometrically.
-            if stalled and abs(d_b) > 1e-9:
-                state["esc_b"] = min(state["esc_b"] * _CB_STEP_GROWTH, hi - lo)
+            state["best_clean"] = (c_app, b_app)
         if note is not None:
-            note(f"Auto CB {tag}: contrast={c_app:.3f}, brightness={b_app:.3f}, "
-                 f"median={bal.median_fraction:.3f}, span={bal.span_fraction:.3f}, "
+            lo, hi = _cb_edges(bal)
+            note(f"Auto CB {tag}: contrast={c_app:.3f}, "
+                 f"brightness={b_app:.3f}, edges={lo:.3f}..{hi:.3f}, "
                  f"wclip={bal.white_clip:.3f}, bclip={bal.black_clip:.3f}, "
                  f"cost={cost:.3f}")
-        return bal
+        return bal, prev
 
-    def _walk_c(direction):
-        """Geometric contrast walk: seed step, x2 per consecutive same-direction
-        move (any window width is reached in log time); direction change resets."""
-        if direction != state["last_c_dir"]:
-            state["esc_c"] = seed_c
-        state["last_c_dir"] = direction
-        step = state["esc_c"]
-        state["esc_c"] = min(state["esc_c"] * _CB_STEP_GROWTH, hi - lo)
-        return _clamp(state["c"] + direction * step, lo, hi)
+    def _adopt_k_b(k):
+        """Adopt or contradict a measured brightness slope. Shared by the
+        direct learn and the sub-gate accumulator so accumulated evidence
+        carries exactly the weight of direct evidence; any adoption or
+        contradiction restarts the accumulation (stale half-runs must
+        never blend into a later estimate)."""
+        if k > 0:
+            state["k_b"] = k
+            state["k_b_learned"] = True
+        else:
+            state["k_b"] = _CB_DEFAULT_K_B
+            state["k_b_learned"] = False
+            state["k_b_contradicted"] = True
+            state["cap_b"] = max(_CB_STEP_CAP_MIN,
+                                 state["cap_b"] * 0.5)
+        state["acc_db"] = state["acc_dmid"] = 0.0
 
-    def _move_b(direction):
-        """Brightness ladder move: like the contrast walk, the step grows x2 per
-        consecutive same-direction move (a deep-black cure must not crawl across
-        the knob at the base step); it resets on direction change and on any
-        material progress (in take). An intervening brightness cure also restarts
-        the contrast walk's growth run -- the gain context has changed."""
-        if direction != state["last_b_dir"]:
-            state["esc_b"] = cfg.brightness_step
-        state["last_b_dir"] = direction
-        state["last_c_dir"] = 0
-        state["esc_c"] = seed_c
-        step = state["esc_b"]
-        state["esc_b"] = min(state["esc_b"] * _CB_STEP_GROWTH, hi - lo)
-        return _clamp(state["b"] + direction * step, lo, hi)
+    def _learn(bal, prev):
+        """Refine the slope magnitudes from a rail-free move.
 
-    def _bisect_move():
-        """Midpoint of a valid, wide-enough bracket, or None."""
-        br = _bracket()
-        if br is None or br[1] - br[0] <= _CB_BRACKET_MIN_WIDTH:
-            return None
-        mid = (br[0] + br[1]) / 2.0
-        if abs(mid - state["c"]) < 1e-6:
-            return None
-        state["esc_c"] = seed_c
-        state["last_c_dir"] = 0
-        return mid
+        Per-knob attribution assumes independence -- the spread responds to
+        contrast, the midpoint to brightness -- which holds to first order;
+        cross-term noise is filtered by the trust floor and by refusing
+        negative slopes (the signs are physics: a measured response that
+        opposes them is noise or a cross-term, and adopting it would aim
+        every later solve backwards, the field Run-4 failure class; such a
+        reading resets the slope to its default and halves the knob's step
+        cap instead)."""
+        p_bal, p_c, p_b = prev
+        if p_bal is None or bal is None:
+            return
+        rail_free = (max(p_bal.white_clip, p_bal.black_clip)
+                     < _CB_HARD_CLIP_FRACTION
+                     and max(bal.white_clip, bal.black_clip)
+                     < _CB_HARD_CLIP_FRACTION)
+        if not rail_free:
+            return
+        dc, db = state["c"] - p_c, state["b"] - p_b
+        p_lo, p_hi = _cb_edges(p_bal)
+        lo, hi = _cb_edges(bal)
+        p_spread, spread = max(p_hi - p_lo, 1e-6), max(hi - lo, 1e-6)
+        # Joint attribution through the plant model (offset applied after
+        # the gain stage): the spread responds to contrast alone, so k_c
+        # comes straight from the spread ratio; and because that ratio is
+        # measured, not modeled, the gain's contribution to the midpoint
+        # change can be subtracted exactly, leaving the brightness slope
+        # clean --
+        # mid_new = mid_prev * r + k_b * db. No single-knob-move
+        # requirement, so every solve iteration refines both slopes.
+        if abs(dc) > 1e-6:
+            d_log = math.log10(spread / p_spread)
+            if abs(d_log) >= _CB_LEARN_TRUST:
+                k = d_log / dc
+                if k > 0:
+                    state["k_c"] = k
+                    state["k_c_learned"] = True
+                else:
+                    state["k_c"] = _CB_DEFAULT_K_C
+                    state["k_c_learned"] = False
+                    state["k_c_contradicted"] = True
+                    state["cap_c"] = max(_CB_STEP_CAP_MIN,
+                                         state["cap_c"] * 0.5)
+        if abs(db) > 1e-6:
+            r = spread / p_spread
+            p_mid = (p_lo + p_hi) / 2.0
+            d_mid_resid = (lo + hi) / 2.0 - p_mid * r
+            if abs(d_mid_resid) >= _CB_LEARN_TRUST:
+                _adopt_k_b(d_mid_resid / db)
+            else:
+                # Sub-gate residual accumulation. Each rail-free residual
+                # is k_b*db + noise: same-sign residuals sum linearly
+                # while the noise sum grows only as sqrt(n), so a true
+                # k_b ~ 1.25 plant -- residual ~0.024 per 0.02 move,
+                # forever under the per-move gate -- teaches within ~2
+                # moves instead of never (the c066 brightness-creep
+                # starvation). A direction flip restarts the run:
+                # opposite-sign residuals are as likely noise as signal,
+                # and letting them cancel would launder a zero response
+                # into a slope. No symmetric k_c accumulator: a wrong k_c
+                # surfaces as a rail landing, which _rail_evidence
+                # converts to slope evidence.
+                if state["acc_db"] * db < 0:
+                    state["acc_db"] = state["acc_dmid"] = 0.0
+                state["acc_db"] += db
+                state["acc_dmid"] += d_mid_resid
+                if (abs(state["acc_dmid"]) >= _CB_LEARN_TRUST
+                        and abs(state["acc_db"]) >= 0.01):
+                    _adopt_k_b(state["acc_dmid"] / state["acc_db"])
 
-    def _decide():
-        """Choose the next (c, b, tag) move, or None when no productive move
-        exists (caller locks best-so-far)."""
+    def _rail_evidence(bal, prev):
+        """A solve move that lands rail-dominated or blind is still slope
+        evidence: the spread grew past what the frame can hold (which is
+        why _learn's rail-free gate leaves the harsh-plant overshoot cycle
+        unable to learn at all -- every solve landing is railed, so the
+        wrong slope drives the next solve too). Sign-causal gate: with
+        db <= 0 the offset moved away from the white rail, so a white-hard
+        landing is the gain's doing (raw |dc| > |db| would mis-gate here --
+        k_b's default makes db large in knob units while the spread
+        response belongs to dc alone). The capacity bound can only
+        underestimate k_c -- a genuine lower bound -- so adopting it still
+        undershoots, the safe side, and an exact rail-free learn
+        overwrites it later. The raise
+        persists (k_c_learned) so a stale gentle persisted seed self-heals
+        and overwrites itself the same session -- the 2026-08-26
+        stale-seed 2-cycle's cure. Black landings and db > 0 landings
+        never qualify; the x4 ceiling bounds a noise-corrupted p_hi; the
+        max(x2, .) floor guarantees geometric progress on repeated
+        re-entries."""
+        p_bal, p_c, p_b = prev
+        if p_bal is None or bal is None:
+            return
+        if cb_span_blind(p_bal) or cb_rail_dominated(p_bal):
+            return
+        white_hard = (bal.white_clip >= _CB_HARD_CLIP_FRACTION
+                      or (cb_span_blind(bal)
+                          and bal.white_clip >= bal.black_clip))
+        dc, db = state["c"] - p_c, state["b"] - p_b
+        if not white_hard or dc <= 1e-6 or db > 1e-6:
+            return
+        _p_lo, p_hi = _cb_edges(p_bal)
+        k_lb = math.log10(max(1.0 - state["k_b"] * db, 1.0)
+                          / max(p_hi, _CB_SPREAD_FLOOR)) / dc
+        k_new = min(state["k_c"] * 4.0, max(state["k_c"] * 2.0, k_lb))
+        if k_new > state["k_c"]:
+            state["k_c"] = k_new
+            state["k_c_learned"] = True  # persists -> stale seeds self-heal
+
+    target_lo = cfg.margin_lo
+    target_hi = 1.0 - cfg.margin_hi
+    target_mid = (target_lo + target_hi) / 2.0
+    target_spread = max(target_hi - target_lo, _CB_SPREAD_FLOOR)
+
+    bal, _ = take(contrast, brightness, "baseline")
+    if bal is None:
+        return _result("no-measure")
+
+    while state["n"] < budget:
         bal = state["bal"]
-        span = bal.span_fraction
-        w_act = bal.white_clip > cfg.max_white_clip + _CB_CLIP_ACT_MARGIN
-        b_act = bal.black_clip > cfg.max_black_clip + _CB_CLIP_ACT_MARGIN
+        if bal is None:
+            # Rewound to last-good; re-measure from there.
+            bal, prev = take(state["c"], state["b"], "re-measure")
+            if bal is None:
+                continue
+        if cb_edges_accepted(bal, cfg):
+            if state["n"] >= budget:
+                break
+            v_bal, _prev = take(state["c"], state["b"], "verify",
+                                measure=verify)
+            if v_bal is not None and cb_edges_accepted(v_bal, cfg,
+                                                       slack=1.25):
+                # Lock the verified point itself. _result picks its point by
+                # cost alone, which can be an earlier, lower-cost measurement
+                # that never passed verification (and its -infeasible switch
+                # could then move the lock off the acceptance entirely) --
+                # converged must mean "the knobs sit at the verified
+                # acceptance".
+                return CBResult(state["c"], state["b"], True,
+                                cb_edge_cost(v_bal, cfg), state["n"],
+                                "converged", _plant(), state["best_clean"])
+            continue
+        if cb_span_blind(bal):
+            # A blind frame carries no measurement at all.
+            lg = state["last_good"]
+            if lg is not None:
+                # A move from a readable frame landed blind: the usable
+                # window is narrower than the step (the 2026-08-14
+                # campaign's core lesson). Bisect between the readable
+                # point and the blind landing -- re-solving from the
+                # readable point just re-applies the same oversized move,
+                # while the midpoint walk homes on the window edge
+                # geometrically, per knob, whatever direction the overshoot
+                # took.
+                mid_c = _clamp((lg[1] + state["c"]) / 2.0, lo_b, hi_b)
+                mid_b = _clamp((lg[2] + state["b"]) / 2.0, lo_b, hi_b)
+                if (abs(mid_c - lg[1]) < 1e-3
+                        and abs(mid_b - lg[2]) < 1e-3):
+                    # The window edge is resolved to knob resolution; carry
+                    # on solving from the readable side with tightened caps
+                    # so the next solve cannot re-cross it.
+                    state["cap_c"] = max(_CB_STEP_CAP_MIN,
+                                         state["cap_c"] * 0.25)
+                    state["cap_b"] = max(_CB_STEP_CAP_MIN,
+                                         state["cap_b"] * 0.25)
+                    state["bal"], state["c"], state["b"] = lg[0], lg[1], lg[2]
+                    continue
+                take(mid_c, mid_b, "bisect")
+                continue
+            # No readable point known yet (a saturated start): retreat both
+            # knobs from the pinning rail at once -- cures a gain overload
+            # and an offset overload alike without having to tell them
+            # apart. Steps grow geometrically; crossing to the opposite
+            # rail reverses at a quarter of the step, a bisection along the
+            # retreat track that cannot strand outside a narrow window.
+            direction = -1.0 if bal.white_clip >= bal.black_clip else 1.0
+            if state["esc_dir"] and direction != state["esc_dir"]:
+                state["esc"] = max(_CB_ESCAPE_SEED / 4.0,
+                                   state["esc"] * 0.25)
+            elif state["esc_dir"]:
+                state["esc"] = min(_CB_ESCAPE_CAP, state["esc"] * 2.0)
+            state["esc_dir"] = direction
+            step = direction * state["esc"]
+            new_c = _clamp(state["c"] + step, lo_b, hi_b)
+            new_b = _clamp(state["b"] + step, lo_b, hi_b)
+            if (abs(new_c - state["c"]) < 1e-6
+                    and abs(new_b - state["b"]) < 1e-6):
+                if note is not None:
+                    note("Auto CB: the image is pinned at a rail even at "
+                         "the knob bounds - the scene carries no usable "
+                         "histogram")
+                return _result("saturated")
+            take(new_c, new_b, "escape")
+            continue
+
         hard_w = bal.white_clip >= _CB_HARD_CLIP_FRACTION
         hard_b = bal.black_clip >= _CB_HARD_CLIP_FRACTION
+        if hard_w or hard_b:
+            # A rail-dominated frame's spread reading lies: the pinned
+            # percentiles squeeze together and the solver would pump gain
+            # deeper into the rail. The trustworthy signal is which rail is
+            # overloaded; relieve it directly.
+            rail_side = -1.0 if hard_w and not hard_b else 1.0
+            prev_rail = state.get("last_rail")
+            same_rail = (bool(prev_rail) and not (hard_w and hard_b)
+                         and rail_side == prev_rail)
+            if (prev_rail and not (hard_w and hard_b)
+                    and rail_side != prev_rail):
+                # Consecutive reliefs flipped the rail: the step crossed
+                # the whole usable window. Halve the caps so the next
+                # relief bisects into it instead of ping-ponging over it.
+                state["cap_c"] = max(_CB_STEP_CAP_MIN, state["cap_c"] * 0.5)
+                state["cap_b"] = max(_CB_STEP_CAP_MIN, state["cap_b"] * 0.5)
+            state["last_rail"] = 0.0 if (hard_w and hard_b) else rail_side
+            if hard_w and hard_b:
+                # Bimodal: the occupied spread does not fit at this gain.
+                # toward still needs a defined direction (relieve the heavier
+                # rail) for the pinned-knob fallback below -- it previously
+                # went unassigned on this path, an UnboundLocalError (or a
+                # stale direction from an earlier single-rail pass) when the
+                # compress move was a no-op at the contrast bound.
+                toward = -1.0 if bal.white_clip >= bal.black_clip else 1.0
+                dc, db, tag = -state["cap_c"], 0.0, "compress"
+            else:
+                toward = rail_side
+                if (abs(state["last_dc"]) > abs(state["last_db"])
+                        and state["last_dc"] * toward < 0):
+                    # The last move was predominantly a gain move toward
+                    # this rail: the gain caused it, so the gain relieves
+                    # it (the v3.3.14 causal lesson -- laddering the other
+                    # knob against a gain overshoot wanders).
+                    if same_rail:
+                        # Re-entering the rail the last relief fled, by
+                        # the knob that caused it: full-cap retreat and
+                        # full-slope solve were cycling over the window
+                        # (the 2026-08-26 stale-seed 2-cycle). Halve the
+                        # causal cap so the retreat bisects into it.
+                        state["cap_c"] = max(_CB_STEP_CAP_MIN,
+                                             state["cap_c"] * 0.5)
+                    dc, db, tag = toward * state["cap_c"], 0.0, "declip"
+                elif (rail_side < 0 and prev_rail == rail_side
+                        and abs(state["last_dc"]) <= 1e-12
+                        and state["last_db"] * toward > 0):
+                    # An offset relief just fled this same white rail and
+                    # the rail still stands: measured evidence the offset
+                    # lacks clip authority here (the ModerateOvershoot
+                    # band's regime -- its wclip barely answers to
+                    # brightness), so the gain takes over. One bounded
+                    # offset probe, never a ladder: on plants where the
+                    # offset does have authority its first relief clears
+                    # or flips the rail and this branch is never reached,
+                    # which keeps the ep5-ep8 fitted plants
+                    # (offset-curable clips) on their efficient reliefs.
+                    # White side only: gain-down is the intrinsically safe
+                    # retreat (less clipping), while a black-side gain-up
+                    # is an expansion move that blows a harsh plant white
+                    # from a standing black rail whose offset relief was
+                    # only ever partial (the Hydra flip-bisection's rungs
+                    # each leave the rail standing on purpose); the
+                    # bottomed-out black case is already covered by the
+                    # pinned-knob fallback below.
+                    dc, db, tag = toward * state["cap_c"], 0.0, "declip"
+                else:
+                    if same_rail and state["last_db"] * toward < 0:
+                        # Same-rail re-entry after the offset moved toward
+                        # this rail: the offset caused it, so only its cap
+                        # tightens. An away-move that is still railed is
+                        # insufficient relief and must repeat at the full,
+                        # unhalved cap -- the anti-stranding rule.
+                        state["cap_b"] = max(_CB_STEP_CAP_MIN,
+                                             state["cap_b"] * 0.5)
+                    dc, db, tag = 0.0, toward * state["cap_b"], "declip"
+            new_c = _clamp(state["c"] + dc, lo_b, hi_b)
+            new_b = _clamp(state["b"] + db, lo_b, hi_b)
+            if (abs(new_c - state["c"]) < 1e-6
+                    and abs(new_b - state["b"]) < 1e-6):
+                # The preferred knob is pinned; relieve with the other one
+                # before giving up (field ep1: brightness bottomed out
+                # while the hot gain still pinned the frame white).
+                if abs(db) > abs(dc):
+                    new_c = _clamp(state["c"] + toward * state["cap_c"],
+                                   lo_b, hi_b)
+                else:
+                    new_b = _clamp(state["b"] + toward * state["cap_b"],
+                                   lo_b, hi_b)
+                if (abs(new_c - state["c"]) < 1e-6
+                        and abs(new_b - state["b"]) < 1e-6):
+                    return _result("no-move")
+            nbal, prev = take(new_c, new_b, tag)
+            if nbal is not None:
+                _learn(nbal, prev)
+            continue
 
-        if w_act or b_act:
-            # A fully pinned rail (hard clip, collapsed span) with a known
-            # rail-free brightness nearby is an OFFSET problem -- when the
-            # offset alone exceeds full scale, no gain can fix it. BISECT the
-            # brightness toward the last rail-free value; this iterates (each
-            # still-pinned midpoint homes in; any unpinned frame refreshes
-            # b_rail_free), unlike the one-shot halving the review refuted.
-            if ((hard_w or hard_b) and span <= cfg.span_floor
-                    and state["b_rail_free"] is not None
-                    and abs(state["b_rail_free"] - state["b"])
-                    > probe.min_knob_delta):
-                new_b = (state["b"] + state["b_rail_free"]) / 2.0
-                state["last_b_dir"] = 1 if new_b > state["b"] else -1
-                state["esc_b"] = cfg.brightness_step
-                return state["c"], _clamp(new_b, lo, hi), "declip"
-            mid = _bisect_move()
-            if mid is not None:
-                return mid, state["b"], "bisect"
-            br = _bracket()
-            if br is not None:
-                # Bracket collapsed (or its midpoint is already measured) while
-                # still clipped: no usable window exists at this brightness ->
-                # cure by offset, relieving whichever rail is worse off, and
-                # restart window discovery at the new offset.
-                state["c_lo"] = state["c_hi"] = None
-                state["c_lo_b"] = state["c_hi_b"] = None
-                white_excess = bal.white_clip - cfg.max_white_clip
-                black_excess = bal.black_clip - cfg.max_black_clip
-                direction = -1 if white_excess > black_excess else 1
-                return state["c"], _move_b(direction), "declip"
-            if w_act and b_act:
-                # BOTH rails actionable (hard or soft): brightness only trades
-                # one rail for the other -- the occupied span does not fit at
-                # this gain, so compress. (The 2026-08-14 ep1 replay showed the
-                # both-HARD-only version of this rule laddering brightness for
-                # 5 wasted measurements while the rails traded.)
-                if state["c"] > lo + 1e-6:
-                    return _walk_c(-1), state["b"], "declip"
-                return None
-            if hard_w:
-                offset_white = cfg.span_floor < span <= cfg.target_contrast_span
-                if offset_white and state["b"] > lo + 1e-6:
-                    return state["c"], _move_b(-1), "declip"
-                if state["c"] > lo + 1e-6:
-                    return _walk_c(-1), state["b"], "declip"
-                if state["b"] > lo + 1e-6:
-                    return state["c"], _move_b(-1), "declip"
-                return None
-            if hard_b:
-                if state["b"] < hi - 1e-6:
-                    return state["c"], _move_b(1), "declip"
-                if state["c"] < hi - 1e-6:
-                    # Brightness railed high yet still hard black: lift the gain.
-                    return _walk_c(1), state["b"], "declip"
-                return None
-            # Soft actionable clip: white with a wide span is gain-driven, all
-            # else is a centring problem.
-            if w_act:
-                if span > cfg.target_contrast_span and state["c"] > lo + 1e-6:
-                    return _walk_c(-1), state["b"], "declip"
-                if state["b"] > lo + 1e-6:
-                    return state["c"], _move_b(-1), "declip"
-                return None
-            if state["b"] < hi - 1e-6:
-                return state["c"], _move_b(1), "declip"
-            return None
+        # last_rail deliberately survives readable frames: a solve that
+        # re-enters the rail the last relief fled must be recognized as a
+        # same-rail re-entry (the 2026-08-26 stale-seed 2-cycle), not as a
+        # fresh rail with a fresh full cap.
+        lo, hi = _cb_edges(bal)
+        spread = max(hi - lo, 1e-6)
+        mid = (lo + hi) / 2.0
+        # Solve: contrast from the spread ratio, then brightness from the
+        # residual midpoint error the gain move leaves behind -- the offset
+        # is applied after the gain stage, so the chosen gain change scales the
+        # midpoint predictably (10^(k_c * dc)) and solving brightness
+        # against the raw midpoint would fight that coupling for the whole
+        # budget. Each slope is a persisted or learned per-tool value, else
+        # the sign-correct default; steps capped per knob.
+        dc = _clamp(math.log10(target_spread / spread) / state["k_c"],
+                    -state["cap_c"], state["cap_c"])
+        new_c = _clamp(state["c"] + dc, lo_b, hi_b)
+        mid_after_gain = mid * (10.0 ** (state["k_c"]
+                                         * (new_c - state["c"])))
+        db = _clamp((target_mid - mid_after_gain) / state["k_b"],
+                    -state["cap_b"], state["cap_b"])
+        new_b = _clamp(state["b"] + db, lo_b, hi_b)
+        if (abs(new_c - state["c"]) < 1e-6
+                and abs(new_b - state["b"]) < 1e-6):
+            # The residual error is below the solvable resolution (or the
+            # knobs are pinned at their bounds in the needed direction).
+            return _result("no-move")
+        nbal, prev = take(new_c, new_b, "solve")
+        if nbal is not None:
+            _learn(nbal, prev)
+            _rail_evidence(nbal, prev)
+    return _result("budget-exhausted")
 
-        # Clean (below ACT). Degenerate span first: recover gain or fail open.
-        if span <= cfg.span_floor:
-            if (state["span_tries"] < _CB_SPAN_RECOVERY_TRIES
-                    and state["c"] < hi - 1e-6):
-                state["span_tries"] += 1
-                return _walk_c(1), state["b"], "span_recover"
-            return None
 
-        # Span out of band: bisect when bracketed, secant-jump when a slope has
-        # been learned (gentle plants need long travel), else walk toward the band.
-        if span < span_lo_band or span > span_hi_band:
-            mid = _bisect_move()
-            if mid is not None:
-                return mid, state["b"], "bisect"
-            if state["k_c"] is not None:
-                new_c = secant_step(span, cfg.target_contrast_span, state["c"],
-                                    state["k_c"], _CB_CONTRAST_JUMP_CAP, lo, hi,
-                                    log_space=True)
-                br = _bracket()
-                if br is not None:
-                    new_c = _clamp(new_c, br[0] + 1e-3, br[1] - 1e-3)
-                if abs(new_c - state["c"]) > 1e-6:
-                    state["esc_c"] = seed_c
-                    state["last_c_dir"] = 0
-                    return new_c, state["b"], "jump_c"
-            direction = 1 if span < span_lo_band else -1
-            at_rail = (state["c"] >= hi - 1e-6) if direction > 0 else (state["c"] <= lo + 1e-6)
-            if not at_rail:
-                return _walk_c(direction), state["b"], "walk_c"
-            # Contrast railed; fall through to the median stage.
-
-        # Median out of band: measured-slope secant, first move doubles as probe.
-        m_err = cfg.target_median_fraction - bal.median_fraction
-        if abs(m_err) > cfg.median_tol:
-            if state["k_b"] is not None:
-                new_b = secant_step(bal.median_fraction, cfg.target_median_fraction,
-                                    state["b"], state["k_b"],
-                                    _CB_BRIGHTNESS_JUMP_CAP, lo, hi,
-                                    log_space=False)
-                if abs(new_b - state["b"]) > 1e-6:
-                    state["last_b_dir"] = 1 if new_b > state["b"] else -1
-                    return state["c"], new_b, "jump_b"
-                # A degenerate secant (zero/railed step, e.g. a corrupted seed)
-                # must not dead-end the brightness leg: fall through to probe.
-            db = _signed_probe_delta(
-                state["b"],
-                probe.brightness_delta if m_err > 0 else -probe.brightness_delta,
-                lo, hi)
-            if abs(db) < 1e-9:
-                return None
-            state["last_b_dir"] = 1 if db > 0 else -1
-            return state["c"], _clamp(state["b"] + db, lo, hi), "probe_b"
-
-        # In band except a deadband clip reading (between ACCEPT and ACT): one
-        # gentle offset trim toward relief; hysteresis keeps this from cycling.
-        if not cb_clip_acceptable(bal, cfg):
-            white_side = (bal.white_clip
-                          > cfg.max_white_clip + _CB_CLIP_ACCEPT_MARGIN)
-            direction = -1 if white_side else 1
-            trim = min(probe.brightness_delta, cfg.brightness_step)
-            new_b = _clamp(state["b"] + direction * trim, lo, hi)
-            if abs(new_b - state["b"]) > 1e-6:
-                state["last_b_dir"] = direction
-                return state["c"], new_b, "trim_clip"
-        return None
-
-    def _best_clean():
-        if state["best_clean_c"] is None:
-            return None
-        return (state["best_clean_c"], state["best_clean_b"])
-
-    def best_result(status):
-        c, b, cost = state["best_c"], state["best_b"], state["best_cost"]
-        if state["best_actionable"] and state["best_clean_c"] is not None:
-            # The lowest-cost point violates the caller's own clip limits while
-            # a clip-clean point WAS measured: the targets are unreachable
-            # clip-clean on this scene (e.g. the target median needs more black
-            # clip than max_black_clip allows). Never lock a point the commit
-            # check can only revert -- lock the best clean one and say why.
-            c, b, cost = (state["best_clean_c"], state["best_clean_b"],
-                          state["best_clean_cost"])
-            # Mark EVERY substituted status (patience / budget-exhausted /
-            # measure-failed), so run_metadata can identify infeasible-config
-            # sessions on any termination path, not just patience.
-            status = f"{status}-infeasible"
-            if note is not None:
-                note(
-                    f"Auto CB infeasible: the lowest-cost point is actionably "
-                    f"clipped (wclip={state['best_wclip']:.3f}, "
-                    f"bclip={state['best_bclip']:.3f}) - the targets conflict "
-                    f"with the clip limits on this scene; locking the best "
-                    f"clip-clean point instead"
-                )
-        return CBResult(c, b, False, cost, state["n"], status, _plant(),
-                        _best_clean())
-
-    def accepted_result(status):
-        return CBResult(state["c"], state["b"], True,
-                        cb_cost(state["bal"], cfg), state["n"], status, _plant(),
-                        _best_clean())
-
-    def _try_accept():
-        """The current balance is in band. Return a final CBResult, or None to
-        keep searching (verify failed / retries exhausted)."""
-        if verify_at is None:
-            return accepted_result("converged")
-        if state["n"] >= budget:
-            # No measurements left to verify with; lock the accepted point (it
-            # WAS measured) rather than reverting to a stale best.
-            return accepted_result("accepted-unverified")
-        if state["verify_fails"] >= _CB_MAX_VERIFY_RETRIES:
-            return None
-        if take(state["c"], state["b"], "verify", measure=verify_at) is None:
-            return best_result("measure-failed")
-        pooled = state["bal"]
-        # The pooled measurement has ~sqrt(frames) lower noise, so hold it to a
-        # TIGHTER clip bound (half the accept margin) than the search reading:
-        # this is what keeps borderline-clipped points from slipping through
-        # acceptance on a lucky noise draw (review: ~1/3 of ep3 noise seeds
-        # locked a cleanly-out-of-band point under the full margin).
-        verify_clip_ok = (
-            pooled.white_clip <= cfg.max_white_clip + _CB_CLIP_ACCEPT_MARGIN / 2.0
-            and pooled.black_clip <= cfg.max_black_clip + _CB_CLIP_ACCEPT_MARGIN / 2.0)
-        if cb_converged(pooled, cfg) and verify_clip_ok:
-            return accepted_result("converged")
-        state["verify_fails"] += 1
-        return None
-
-    if take(contrast, brightness, "baseline") is None:
-        return best_result("no-measure")
-
-    while True:
-        bal = state["bal"]
-        if bal is not None and cb_converged(bal, cfg):
-            result = _try_accept()
-            if result is not None:
-                return result
-        if state["since_improve"] >= _CB_PATIENCE:
-            return best_result("patience")
-        if state["n"] >= budget:
-            break
-        decision = _decide()
-        if decision is None:
-            break
-        new_c, new_b, tag = decision
-        if abs(new_c - state["c"]) < 1e-6 and abs(new_b - state["b"]) < 1e-6:
-            break
-        if take(new_c, new_b, tag) is None:
-            return best_result("measure-failed")
-    return best_result("budget-exhausted")
+def _clamp(value, lo, hi):
+    return min(hi, max(lo, value))

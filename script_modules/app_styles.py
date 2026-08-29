@@ -24,7 +24,7 @@ class StyleColors:
     # Plot colors
     PLOT_BG = "#000000"
     PLOT_INTERACTIVE_LINE_COLOR = "#04f5ff"
-    PLOT_LINE_COLOR = "#eb70a9" # plot line color, v2.5: #38003c, catbug: a1c7ea (blue), bright_blue: 9df1ed, catbug (glove): eb70a9, TEM blue: #00CEC8
+    PLOT_LINE_COLOR = "#eb70a9"
     PLOT_SPINE_COLOR = "#ffffff"
     PLOT_SPECIMEN_CURRENT_COLOR = "#f5c842"
 
@@ -47,6 +47,13 @@ class StyleDimensions:
     COLUMN_LAYOUT_MINIMUM_WIDTH = 460   # Minimum width for column layouts (pattern plot group boxes)
     CHECKBOX_SPACING = "16px"
     RESULT_LABEL_MARGIN = "2px"
+    # Horizontal inset between a result chip's edge and its value. Explicit,
+    # because it used to be an accident: left-aligned QLabels get a small
+    # automatic indent against the aligned edge, and centering the values
+    # (2026-08-27) removed it -- the text then hugged the chip edges (field
+    # report 2026-08-28). Shared by the default and match (green) chip styles
+    # so the pass/fail style swap never resizes the chip.
+    RESULT_LABEL_HPAD = "6px"
     SETTINGS_DIALOG_WIDTH = 460
     COMBOBOX_WIDTH = 180
     # Plot dimensions
@@ -64,7 +71,29 @@ class StyleDimensions:
 
 
 # Single source of truth for the app version (window title, launch banner).
-APP_VERSION = "3.3.9"
+APP_VERSION = "3.4.4"
+
+
+class StatusText:
+    """
+    Status-bar wording for microscope states the worker reports from more
+    than one site. One constant per state: duplicate literals drifted apart
+    (the same FIB-inactive pause read differently at the loop guard and the
+    batch boundary), and the operator reads different words as different
+    states. This module stays Qt-free so the worker can import it safely.
+    """
+
+    CONNECTING = "Connecting to microscope..."
+    # The status bar's right-side connection indicator (the Hydra utilities
+    # vocabulary -- short, because there is nothing else the app could be
+    # connected to; field decision 2026-08-28).
+    CONNECTED = "Connected"
+    NOT_CONNECTED = "Not connected"
+    FIB_BEAM_OFF = "FIB beam is off - waiting for it to turn on..."
+    COMM_RETRY = "Microscope communication issue - retrying..."
+    FIB_INACTIVE_PAUSED = ("FIB quadrant is not active - monitoring paused "
+                           "until the FIB is selected again")
+    FIB_ACTIVE_RESUMED = "FIB quadrant active - monitoring resumed"
 
 
 class WindowText:
@@ -72,13 +101,16 @@ class WindowText:
     WINDOW_TITLE = f"ATC Monitor {APP_VERSION}"
 
     WINDOW_INFO_LABEL_1 = ""
-    
+
     WINDOW_INFO_LABEL_2 = "Click Start to begin monitoring."
 
     # Catbug status messages shown while a run is active (see information_label_2).
     WINDOW_INFO_MONITORING_ACTIVE = "Monitoring (patterning detected)..."
     WINDOW_INFO_MONITORING_IDLE = "Monitoring (waiting for patterning)..."
     WINDOW_INFO_MONITORING_PAUSED = "Monitoring paused"
+    # Shared with the worker's status-bar text: the operator reads the catbug
+    # and the bar as one connecting state, so the words must not drift.
+    WINDOW_INFO_CONNECTING = StatusText.CONNECTING
 
     SETTINGS_DIALOG_TITLE = "ATC Monitor Settings"
 
@@ -119,8 +151,9 @@ class ToolTips:
     CONFIRMATION_ROUNDS_LABEL = "The number of consecutive rounds that must meet the passing criteria \n" + \
                                 "before confirming the FIB patterning is complete."
     
-    SHOW_GRAYSCALE_IMAGES_CHECKBOX = "Toggle to show grayscale RTM images in the image display area.\n" + \
-                                     "When unchecked, the binary / foreground map is shown instead of grayscale RTM images."
+    SHOW_RTM_IMAGES_CHECKBOX = "Toggle to show the processed RTM images in the image display area.\n" + \
+                               "When unchecked, the analysis view is shown instead: the binary image for the\n" + \
+                               "white-pixel methods, or the foreground map for Top-Hat Foreground Energy."
     
     SAVE_DATA_CHECKBOX = "Toggle to save analysis data to a time-stamped Saved_Data folder in the ATC Monitor application folder."
 
@@ -132,7 +165,7 @@ class ToolTips:
 
     PERCENT_PIXELS_CHECKBOX = "Toggle to include the foreground metric (Percent Pixels / Foreground Energy) as a criterion for confirming FIB patterning completion."
 
-    PERCENT_PIXELS_RESULT = "The most recent foreground-metric value for this pattern. A '(stall)' suffix means completion was reached via the stall latch."
+    PERCENT_PIXELS_RESULT = "The most recent foreground-metric value for this pattern. A '(stall)' annotation below the value means completion was reached via the stall latch."
 
     # Settings dialog tool tips
 
@@ -159,7 +192,7 @@ class ToolTips:
                                 "Top-Hat Foreground Energy: a morphological white top-hat (set the Top-Hat Radius)\n" + \
                                 "that is agnostic to the background level - it isolates bright, sharply textured\n" + \
                                 "features even when the background is dark vs. gray across patterns. It reports a\n" + \
-                                "continuous energy (~2-16), not a 0-100% count, so set Maximum Pixels to ~2.5-3.0.\n\n" + \
+                                "continuous energy (~2-16), not a 0-100% count, so set the Maximum Pixels Threshold to ~2.5-3.0.\n\n" + \
                                 "Any change of method shifts the foreground-metric scale, so re-check the Maximum Pixels Threshold."
 
     TOPHAT_RADIUS_LABEL = "Disk radius (px) for the Top-Hat Foreground Energy method - the largest foreground\n" + \
@@ -171,7 +204,7 @@ class ToolTips:
                                 "Top-Hat Radius) instead of the grayscale image. This makes the match score track\n" + \
                                 "structural foreground change and ignore background / brightness drift. Works with\n" + \
                                 "any binarization method (independent of the foreground metric). The match-score\n" + \
-                                "scale differs from grayscale, so re-check the Match Score threshold when enabling this."
+                                "scale differs from grayscale, so re-check the Match Score Threshold when enabling this."
 
     FOREGROUND_COMPLETION_MODE_LABEL = "How the foreground (Percent Pixels / Foreground Energy) completion criterion decides 'done'.\n\n" + \
                                        "Absolute (threshold): foreground value must fall to or below the Maximum Pixels threshold (original behavior).\n\n" + \
@@ -212,12 +245,11 @@ class ToolTips:
                                    "If the aspect ratio of the patterns is below this threshold, then pattern monitoring will remain idle.\n" + \
                                    "This is designed to detect stress-relief cut patterns from AutoTEM Cryo, which are often quite narrow."
 
-    MIN_PATTERN_SPLITS_LABEL = "The minimum number of regions per dimension (rows and columns) the RTM image is divided into for image analysis.\n" + \
-                               "This applies to the crop rectangle area of the RTM image.\n" + \
-                               "For example, if the value is 2, then the RTM image is divided into 4 sub-regions (two rows and two columns) for analysis.\n\n" + \
-                               "The cropped area of the RTM image is divided into a grid of sub-regions. The mean pixel values and match scores are calculated for each sub-region.\n" + \
-                               "The highest mean pixel value and match score among the sub-regions are used for the results evaluation algorithm.\n" + \
-                               "A higher number of sub-regions can increase sensitivity to small changes in the patterns, but this may result in values not reaching their thresholds."
+    MIN_PATTERN_SPLITS_LABEL = "The minimum number of rows and columns the cropped RTM area is divided into\n" + \
+                               "for analysis (2 gives a 2x2 grid of four sub-regions). Mean pixel values and\n" + \
+                               "match scores are calculated per sub-region, and the highest of each drives the\n" + \
+                               "results evaluation. More sub-regions increase sensitivity to small changes in\n" + \
+                               "the patterns, but values may then struggle to reach their thresholds."
 
     TARGET_TILE_SIZE_LABEL = "The target tile size (in pixels) for the RTM sub-regions (e.g., 100x100 pixel tiles).\n" + \
                              "The actual number of sub-regions is calculated based on the size of the crop area, the target tile size, and the minimum number of sub-regions.\n" +\
@@ -225,48 +257,57 @@ class ToolTips:
 
     # Contrast/Brightness Calibration tool tips
 
+    CB_RECALIBRATE_EVERY_SESSION_LABEL = "By default only the first patterning session of a run is calibrated; later sessions\n" + \
+                                         "keep that lock (each calibration mills the live pattern for its duration, and later\n" + \
+                                         "sessions start from an already-calibrated detector). Enable this to recalibrate at\n" + \
+                                         "the start of every patterning session instead. Editable during a run; a change\n" + \
+                                         "applies from the next patterning session."
+
     CB_AUTO_ON_START_LABEL = "Automatically balance detector contrast/brightness once when patterning starts,\n" + \
                              "then hold it static for the rest of the session (so the analysis criteria are not disrupted).\n" + \
                              "If not enabled, you may need to manually optimize the contrast and brightness values of the live RTM data."
 
-    CB_WHITE_LEVEL_LABEL = "Fallback detector full-scale / saturation ceiling (raw pixel value) used to detect clipping.\n" + \
+    CB_WHITE_LEVEL_LABEL = "The fallback detector full-scale (saturation ceiling, raw pixel value) used to detect clipping.\n" + \
                            "Calibration normally auto-detects this from the imaging bit depth (2^bits - 1, e.g. 255 for\n" + \
                            "8-bit, 65535 for 16-bit); this value is only used when the bit depth cannot be read. The\n" + \
                            "first calibration logs the white level it actually used plus the observed pixel min/max."
 
-    CB_TARGET_MEDIAN_FRACTION_LABEL = "Desired median image brightness as a fraction of full-scale (0-1).\n" + \
-                                      "This is the CENTER of an acceptance band: any median within about +/-0.20 of it\n" + \
-                                      "is accepted (the downstream analysis rescales images, so an exact level is not needed)."
+    CB_LOWER_MARGIN_LABEL = "How far the darkest material in the image sits above pure black, as a fraction\n" + \
+                            "of the full brightness range (0 = at black; the default 0.15 holds it at 15%\n" + \
+                            "brightness). Calibration aims the histogram's dark edge at this level and accepts\n" + \
+                            "a wide band around it, since the analysis rescales images. Together the two\n" + \
+                            "margins place the whole image: brightness centers it, contrast stretches it to fit."
 
-    CB_TARGET_CONTRAST_SPAN_LABEL = "Desired contrast: the robust occupied span (p2-p98 of the pixels) as a\n" + \
-                                    "fraction of full-scale (0-1). This is the CENTER of an acceptance band\n" + \
-                                    "(about +/-0.25): calibration accepts any span inside the band and holds it\n" + \
-                                    "static for the session. A single hot/dead pixel does not affect it\n" + \
-                                    "(percentile-based, not min/max). Calibration will not push past the\n" + \
-                                    "Max White/Black Clip limits, so use those to permit (or forbid) clipping."
+    CB_UPPER_MARGIN_LABEL = "How far the brightest material in the image sits below pure white, as a fraction\n" + \
+                            "of the full brightness range (0 = at white; the default 0.20 holds it at 80%\n" + \
+                            "brightness). Larger values give a grayer image with brightness in reserve, so\n" + \
+                            "material that darkens as milling proceeds stays measurable. Calibration never\n" + \
+                            "pushes past the Max White Clip or Max Black Clip limits."
 
-    CB_MAX_WHITE_CLIP_FRACTION_LABEL = "Maximum acceptable fraction of pixels clipped at the ceiling (white).\n" + \
+    CB_MAX_WHITE_CLIP_FRACTION_LABEL = "The maximum acceptable fraction of pixels clipped at the ceiling (white).\n" + \
                                        "Keep this tight: white saturation flattens exactly the bright texture the\n" + \
                                        "analysis measures. Raise it only to deliberately allow clipping."
 
-    CB_MAX_BLACK_CLIP_FRACTION_LABEL = "Maximum acceptable fraction of pixels clipped at the floor (black).\n" + \
+    CB_MAX_BLACK_CLIP_FRACTION_LABEL = "The maximum acceptable fraction of pixels clipped at the floor (black).\n" + \
                                        "May be looser than the white limit: black pixels are background the\n" + \
                                        "analysis removes anyway."
 
-    CB_MIN_BOUND_LABEL = "Lower clamp for normalized detector contrast/brightness (C/B) values (0-1).\n" + \
-                         "The controller will never set C/B below this value."
+    CB_MIN_BOUND_LABEL = "The lower clamp on normalized detector contrast/brightness (C/B) values (0-1).\n" + \
+                         "Calibration never sets C/B below this value."
 
-    CB_MAX_BOUND_LABEL = "Upper clamp for normalized detector contrast/brightness (C/B) values (0-1).\n" + \
-                         "The controller will never set C/B above this value."
+    CB_MAX_BOUND_LABEL = "The upper clamp on normalized detector contrast/brightness (C/B) values (0-1).\n" + \
+                         "Calibration never sets C/B above this value."
 
-    CB_MAX_ITERATIONS_LABEL = "Measurement budget for one calibration: the total number of RTM measurements\n" + \
+    CB_MAX_ITERATIONS_LABEL = "The measurement budget for one calibration - the total number of RTM measurements\n" + \
                               "(including the final verification) taken before locking at the best setting reached.\n" + \
-                              "The loop exits early on acceptance; a typical calibration uses well under the budget."
+                              "Calibration exits early on acceptance; a typical run uses well under the budget."
 
-    CB_SETTLE_SECONDS_LABEL = "Time to wait after each contrast/brightness change before re-imaging.\n" + \
+    CB_SETTLE_SECONDS_LABEL = "The minimum time to wait after each contrast/brightness change before re-imaging.\n" + \
+                              "One RTM frame period is always allowed even if this is set lower, so that a\n" + \
+                              "measurement can never read a frame captured before the change landed.\n" + \
                               "Increase this if your RTM frames are slow to form after a change."
 
-    CB_FRAMES_PER_MEASUREMENT_LABEL = "Number of RTM frames pooled for the accept/verify measurements (noise control).\n" + \
+    CB_FRAMES_PER_MEASUREMENT_LABEL = "The number of RTM frames pooled for the accept/verify measurements (noise control).\n" + \
                                       "Search measurements always use a single frame, so calibration stays fast;\n" + \
                                       "raise this if calibration accepts settings that look wrong on inspection."
 
@@ -320,6 +361,9 @@ class LabelStyles:
                 color: {StyleColors.TEXT_PRIMARY};
                 margin-left: {StyleDimensions.MARGIN};
             }}
+            QLabel:disabled {{
+                color: {StyleColors.TEXT_DISABLED};
+            }}
             QToolTip {{
                 background-color: {StyleColors.BUTTON_BG};
                 color: {StyleColors.TEXT_PRIMARY};
@@ -329,7 +373,7 @@ class LabelStyles:
                 font-size: {StyleDimensions.FONT_SIZE_LARGE};
             }}
         """
-    
+
     @staticmethod
     def result_match() -> str:
         return f"""
@@ -341,6 +385,8 @@ class LabelStyles:
                 border-radius: {StyleDimensions.BORDER_RADIUS_SMALL};
                 margin-top: {StyleDimensions.RESULT_LABEL_MARGIN};
                 margin-bottom: {StyleDimensions.RESULT_LABEL_MARGIN};
+                padding-left: {StyleDimensions.RESULT_LABEL_HPAD};
+                padding-right: {StyleDimensions.RESULT_LABEL_HPAD};
             }}
             QToolTip {{
                 background-color: {StyleColors.BUTTON_BG};
@@ -359,6 +405,8 @@ class LabelStyles:
                 color: {StyleColors.TEXT_PRIMARY};
                 margin-top: {StyleDimensions.RESULT_LABEL_MARGIN};
                 margin-bottom: {StyleDimensions.RESULT_LABEL_MARGIN};
+                padding-left: {StyleDimensions.RESULT_LABEL_HPAD};
+                padding-right: {StyleDimensions.RESULT_LABEL_HPAD};
             }}
         """
     
@@ -371,6 +419,8 @@ class LabelStyles:
                 color: {StyleColors.TEXT_PRIMARY};
                 margin-top: {StyleDimensions.RESULT_LABEL_MARGIN};
                 margin-bottom: {StyleDimensions.RESULT_LABEL_MARGIN};
+                padding-left: {StyleDimensions.RESULT_LABEL_HPAD};
+                padding-right: {StyleDimensions.RESULT_LABEL_HPAD};
             }}
             QToolTip {{
                 background-color: {StyleColors.BUTTON_BG};
@@ -487,6 +537,10 @@ class GroupBoxStyles:
                 padding: 0 10px;
                 background-color: {StyleColors.GROUPBOX_BG};
             }}
+            QGroupBox:disabled {{
+                color: {StyleColors.TEXT_DISABLED};
+                border: 1px solid {StyleColors.BUTTON_DISABLED};
+            }}
         """
 
 
@@ -547,8 +601,13 @@ class DoubleSpinBoxStyles:
                 width: 0px;
                 height: 0px;
             }}
+            QDoubleSpinBox:disabled {{
+                background-color: {StyleColors.BUTTON_DISABLED};
+                color: {StyleColors.TEXT_DISABLED};
+                border: 1px solid {StyleColors.BUTTON_DISABLED};
+            }}
         """
-    
+
     @staticmethod
     def auto_adjusted() -> str:
         return f"""
@@ -569,6 +628,11 @@ class DoubleSpinBoxStyles:
             QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
                 width: 0px;
                 height: 0px;
+            }}
+            QDoubleSpinBox:disabled {{
+                background-color: {StyleColors.BUTTON_DISABLED};
+                color: {StyleColors.TEXT_DISABLED};
+                border: 1px solid {StyleColors.BUTTON_DISABLED};
             }}
         """
 
@@ -751,6 +815,11 @@ class ComboBoxStyles:
             QComboBox:hover {{
                 border: 1px solid {StyleColors.BUTTON_HOVER};
             }}
+            QComboBox:disabled {{
+                background-color: {StyleColors.BUTTON_DISABLED};
+                color: {StyleColors.TEXT_DISABLED};
+                border: 1px solid {StyleColors.BUTTON_DISABLED};
+            }}
             QComboBox::drop-down {{
                 border: none;
                 width: 40px;
@@ -853,6 +922,7 @@ class AppStyles:
     Button = ButtonStyles
     SpinBox = DoubleSpinBoxStyles
     AppText = WindowText
+    StatusText = StatusText
     AppToolTips = ToolTips
     CheckBox = CheckBoxStyles
     RadioButton = RadioButtonStyles

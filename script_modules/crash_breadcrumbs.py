@@ -9,7 +9,7 @@ through the same kept-open crash file faulthandler uses, so even a crash that
 loses every queued record still bounds the death to a phase.
 
 Rules of the road:
-- drop() must NEVER raise and must stay cheap: one write + flush, guarded by a
+- drop() must never raise and must stay cheap: one write + flush, guarded by a
   blanket try/except. It is called from both the GUI and the worker thread; a
   single buffered .write of one small string is GIL-atomic enough for this
   diagnostic duty (faulthandler itself writes via the raw fd independently).

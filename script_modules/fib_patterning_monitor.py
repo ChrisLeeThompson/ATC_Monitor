@@ -12,6 +12,7 @@ Key responsibilities:
 - RTM data acquisition setup
 """
 
+import importlib
 import logging
 from dataclasses import dataclass
 
@@ -54,6 +55,50 @@ except ImportError:
     CleaningCrossSectionPattern = None
     GetRtmPositionSettings = None
     ClientEndpoint = None
+
+
+# GetRtmDataSettings carries wait_for_next_data, the flag that makes get_data()
+# block until genuinely new data exists ("the user does not want to process the
+# same data twice"). It is the authoritative frame-advance signal: without it,
+# Auto CB has to infer staleness from pixel statistics, which cannot tell a
+# frozen buffer from a saturated scene whose frames legitimately do not change
+# (the 2026-08-23 "RTM frames not advancing" false positives).
+#
+# Imported separately and tolerantly: the reference manual documents it under
+# _structures_rtm, but the public re-export path varies by SDK build (the
+# neighboring GetRtmPositionSettings ships from autoscript_toolkit), and a
+# missing symbol must degrade to a bare get_data() rather than take the whole
+# AutoScript import down with it.
+GetRtmDataSettings = None
+if AUTOSCRIPT_AVAILABLE:
+    for _rtm_settings_module in ("autoscript_sdb_microscope_client.structures",
+                                 "autoscript_sdb_microscope_client._structures_rtm",
+                                 "autoscript_toolkit.template_matchers"):
+        try:
+            GetRtmDataSettings = getattr(
+                importlib.import_module(_rtm_settings_module), "GetRtmDataSettings"
+            )
+            logger.info(f"GetRtmDataSettings imported from {_rtm_settings_module}")
+            break
+        except (ImportError, AttributeError):
+            continue
+    if GetRtmDataSettings is None:
+        logger.warning(
+            "GetRtmDataSettings not available in this AutoScript build - Auto CB "
+            "falls back to statistical stale-frame detection"
+        )
+
+
+# acquire_rtm_data message for "the RTM has no new data" -- a legitimate answer
+# from wait_for_next_data (the patterning job ended without collecting more),
+# not an acquisition failure. Auto CB treats it as the frozen-buffer verdict.
+RTM_NO_NEW_DATA = "No new RTM data"
+
+# acquire_rtm_data message confirming the returned frame is one the caller has
+# not seen before (wait_for_next_data was requested and honored). Auto CB skips
+# its statistical stale-frame check entirely on this message -- the SDK has
+# already answered the question the check exists to guess at.
+RTM_FRESH_DATA = "RTM data acquired successfully (new frame)"
 
 
 # ===========================
@@ -123,7 +168,7 @@ def _suppress_autoscript_vitality_check():
     We call AutoScript constantly, so a dropped connection is still detected and
     recovered on the next real call (perform_call); the proactive keep-alive is
     not needed for our usage. Applied in two best-effort, reversible layers and
-    MUST run before microscope.connect():
+    must run before microscope.connect():
       1) push VITALITY_CHECK_INTERVAL far out (documented constant), and
       2) replace the private thread-starter with a no-op so it never runs.
     """
@@ -407,7 +452,7 @@ def validate_patterns(
             return ValidationResult(
                 success=False,
                 patterns=pattern_infos,
-                # Every number in a message that reaches the STATUS BAR must
+                # Every number in a message that reaches the status bar must
                 # carry a format spec: the threshold arrives as a raw float
                 # from the spinbox/QSettings and renders as e.g.
                 # "0.44999999999999996" otherwise (field report 2026-08-21).
@@ -478,28 +523,49 @@ def setup_rtm_monitoring(microscope: object, mode: str = "HIGH_RESOLUTION") -> t
         return False, "RTM setup failed"
 
 
-def acquire_rtm_data(microscope: object) -> tuple[object | None, object | None, str]:
+def acquire_rtm_data(
+    microscope: object, wait_for_next_data: bool = False
+) -> tuple[object | None, object | None, str]:
     """
     Acquire RTM data and positions from the microscope.
-    
+
     :param microscope: Connected microscope object
-    :return: (rtm_data, rtm_positions, message)
+    :param wait_for_next_data: when True, ask the RTM for the next data set
+        instead of whatever is currently buffered, so the caller can never
+        process the same frame twice. Auto CB uses this as its frame-advance
+        signal. The monitoring loop leaves it False: it must never block on a
+        pattern that has stopped emitting. Requires GetRtmDataSettings -- the
+        call degrades to a plain get_data() when the SDK does not expose it,
+        which the caller detects from the returned message.
+    :return: (rtm_data, rtm_positions, message). rtm_data is None with the
+        message RTM_NO_NEW_DATA when wait_for_next_data found no new frame.
     """
     if not AUTOSCRIPT_AVAILABLE or microscope is None:
         return None, None, "Microscope not available"
-    
+
     try:
-        # Get RTM data
-        rtm_data = microscope.patterning.real_time_monitor.get_data()
-        
+        # Get RTM data. With wait_for_next_data the SDK returns None when the
+        # patterning job ended without collecting more -- "no new frame", which
+        # is reported distinctly so the caller does not read it as a failure.
+        if wait_for_next_data and GetRtmDataSettings is not None:
+            rtm_data = microscope.patterning.real_time_monitor.get_data(
+                GetRtmDataSettings(None, True)
+            )
+            if rtm_data is None:
+                return None, None, RTM_NO_NEW_DATA
+        else:
+            rtm_data = microscope.patterning.real_time_monitor.get_data()
+
         # Create position settings for IMAGE_PIXELS coordinate system
         position_settings = GetRtmPositionSettings(None, RtmCoordinateSystem.IMAGE_PIXELS)
         
         # Get RTM positions using the position settings
         rtm_positions = microscope.patterning.real_time_monitor.get_positions(position_settings)
 
+        if wait_for_next_data and GetRtmDataSettings is not None:
+            return rtm_data, rtm_positions, RTM_FRESH_DATA
         return rtm_data, rtm_positions, "RTM data acquired successfully"
-        
+
     except Exception:
         logger.error("Error acquiring RTM data", exc_info=True)
         return None, None, "RTM data acquisition failed"
@@ -546,7 +612,7 @@ def check_fib_beam_on(microscope: object) -> tuple[bool | None, str]:
 
     The ion beam auto-turns-off after a period of inactivity (~60 min idle).
     Several AutoScript calls (e.g. service.system.name) fault natively when the
-    beam is off, so callers should check this FIRST and wait while it is off.
+    beam is off, so callers should check this first and wait while it is off.
 
     Tri-state result so a transient communication failure is not mistaken for
     "beam off":
@@ -642,7 +708,7 @@ def _clamp_to_detector_limits(prop: object, value: float, lo: float, hi: float,
 
     AutoScript CB properties may expose a ``.limits`` (min, max); we never write
     outside it. ``cached`` supplies limits read earlier (the calibration loop
-    reads them ONCE instead of paying two SDK round-trips per write). If limits
+    reads them once instead of paying two SDK round-trips per write). If limits
     can't be read we fall back to the configured bounds.
     """
     low, high = lo, hi

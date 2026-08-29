@@ -433,37 +433,37 @@ class CBWhiteLevel(StyledDoubleSpinBox):
         self.setValue(initial_value)
 
 
-class CBTargetMedianFraction(StyledDoubleSpinBox):
+class CBLowerMargin(StyledDoubleSpinBox):
 
     def __init__(self, parent=None, constraints: SpinBoxConstraints | None = None,
-                 initial_value: float = 0.45):
+                 initial_value: float = 0.15):
         super().__init__(parent)
         if constraints:
-            self.setMinimum(constraints.cb_target_median_fraction_min)
-            self.setMaximum(constraints.cb_target_median_fraction_max)
-            self.setDecimals(constraints.cb_target_median_fraction_decimals)
-            self.setSingleStep(constraints.cb_target_median_fraction_single_step)
+            self.setMinimum(constraints.cb_lower_margin_min)
+            self.setMaximum(constraints.cb_lower_margin_max)
+            self.setDecimals(constraints.cb_lower_margin_decimals)
+            self.setSingleStep(constraints.cb_lower_margin_single_step)
         else:
-            self.setMinimum(0.05)
-            self.setMaximum(0.95)
+            self.setMinimum(0.0)
+            self.setMaximum(0.45)
             self.setDecimals(2)
             self.setSingleStep(0.05)
         self.setValue(initial_value)
 
 
-class CBTargetContrastSpan(StyledDoubleSpinBox):
+class CBUpperMargin(StyledDoubleSpinBox):
 
     def __init__(self, parent=None, constraints: SpinBoxConstraints | None = None,
-                 initial_value: float = 0.55):
+                 initial_value: float = 0.20):
         super().__init__(parent)
         if constraints:
-            self.setMinimum(constraints.cb_target_contrast_span_min)
-            self.setMaximum(constraints.cb_target_contrast_span_max)
-            self.setDecimals(constraints.cb_target_contrast_span_decimals)
-            self.setSingleStep(constraints.cb_target_contrast_span_single_step)
+            self.setMinimum(constraints.cb_upper_margin_min)
+            self.setMaximum(constraints.cb_upper_margin_max)
+            self.setDecimals(constraints.cb_upper_margin_decimals)
+            self.setSingleStep(constraints.cb_upper_margin_single_step)
         else:
-            self.setMinimum(0.20)
-            self.setMaximum(0.95)
+            self.setMinimum(0.0)
+            self.setMaximum(0.45)
             self.setDecimals(2)
             self.setSingleStep(0.05)
         self.setValue(initial_value)

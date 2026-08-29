@@ -1,6 +1,10 @@
 [project]
-name = "ATC Monitor"
-version = "3.3.9"
+# PEP 621 forbids spaces in a project name, and a spec-aware consumer (pip,
+# build, setuptools, validate-pyproject) rejects the whole file over it -- so
+# the display form lives in `description`.
+name = "atc-monitor"
+version = "3.4.4"
+description = "ATC Monitor - completion detection for FIB lamella milling from the AutoScript real-time monitor"
 requires-python = ">=3.11"
 dependencies = [
     # Pinned to the validated version. Qt object-lifetime behavior is

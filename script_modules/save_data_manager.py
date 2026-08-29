@@ -49,7 +49,7 @@ Images:
       reconstructing these from raw frames.
     - All saved as 8-bit or 16-bit PNG (lossless)
 
-Metrics CSV columns (see METRICS_FIELDNAMES — single source of truth):
+Metrics CSV columns (see METRICS_FIELDNAMES -- single source of truth):
     batch_number, image_number, raw_width, raw_height, crop_width,
     crop_height, mean_pixel_value, mean_pixel_slope, match_score,
     white_pixel_percentage, smoothed_foreground, running_peak, stall_latched
@@ -361,9 +361,9 @@ class SaveDataManager:
             )
             return
 
-        # Deliberately does NOT touch _batch_counters: metrics rows continue after
+        # Deliberately does not touch _batch_counters: metrics rows continue after
         # a pattern completes while image saves stop, and _batch_counters must keep
-        # meaning "last SAVED image batch" so build_pattern_detail's total_batches
+        # meaning "last saved image batch" so build_pattern_detail's total_batches
         # matches the PNGs actually on disk.
         if batch_number is not None:
             batch_num = int(batch_number)
@@ -456,7 +456,7 @@ class SaveDataManager:
     
     def finalize(self, metadata: dict):
         """
-        Finalize the run — save all accumulated data.
+        Finalize the run -- save all accumulated data.
         
         Call this at the end of a monitoring session. Writes:
         1. Metrics CSV for each pattern
@@ -495,7 +495,7 @@ class SaveDataManager:
         Assemble the run metadata dictionary.
 
         :param microscope_data: Microscope settings (ion species, voltage, etc.)
-            NOTE: detector contrast/brightness in this block are read BEFORE the
+            Note: detector contrast/brightness in this block are read before the
             auto-CB calibration runs; the post-calibration values live in the
             cb_calibration block.
         :param ui_parameters: UI parameter values
@@ -536,12 +536,13 @@ class SaveDataManager:
         Write the auto-CB per-measurement trace beside run_metadata.json.
 
         One row per calibration measurement (n, tag, frames, contrast,
-        brightness, median, span, wclip, bclip, cost). No-op when empty.
+        brightness, p2, p98, median, span, wclip, bclip, cost). No-op when
+        empty.
         """
         if not rows:
             return
         fieldnames = ["n", "tag", "frames", "contrast", "brightness",
-                      "median", "span", "wclip", "bclip", "cost"]
+                      "p2", "p98", "median", "span", "wclip", "bclip", "cost"]
         path = self._run_dir / "cb_trace.csv"
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
@@ -577,7 +578,7 @@ class SaveDataManager:
         :param criteria_met_batch: Batch number at which all criteria were met,
             or None if the pattern never completed. The metric values for that
             batch live in the per-batch metrics CSV, keyed by this number.
-        :param completion_status: Whether THIS pattern completed when the run
+        :param completion_status: Whether this pattern completed when the run
             ended, e.g. "CRITERIA_MET" | "INCOMPLETE" (independent of the
             run-level status -- one pattern can complete before a user stop).
         :param crop_rect_history: List of {"batch": N, "rect": [x, y, w, h]}
@@ -585,7 +586,7 @@ class SaveDataManager:
             alone silently loses operator changes made mid-run).
         :return: Pattern detail dictionary for inclusion in metadata
         """
-        # total_batches = last SAVED image batch (image saves stop at pattern
+        # total_batches = last saved image batch (image saves stop at pattern
         # completion, so for a completed pattern this equals criteria_met_batch and
         # always matches the PNG files on disk; post-completion metrics rows are
         # not counted here -- the metrics CSV carries its own batch numbers).
