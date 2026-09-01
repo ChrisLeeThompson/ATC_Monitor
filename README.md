@@ -5,8 +5,7 @@ ATC Monitor watches a focused ion beam (FIB) mill a lamella and tells you when i
 It reads the microscope's real-time monitor (RTM) image stream through the Thermo Scientific
 AutoScript SDK, tracks how each pattern's milled area is changing, and stops patterning
 automatically once every pattern has met its completion criteria for a set number of consecutive
-confirmation rounds. It is designed to run unattended alongside AutoTEM Cryo so that milling does
-not continue past the point where the feature of interest is exposed.
+confirmation rounds. It is designed to run unattended alongside AutoTEM Cryo.
 
 ## Requirements
 
@@ -43,12 +42,11 @@ application stops patterning and saves its results.
 
 The foreground criterion also has a stall latch, selected by the Foreground Completion Mode
 setting. Some samples expose static material, such as a grid bar, that holds the foreground metric
-above any threshold you could have chosen in advance; milling then runs forever. In
+above any threshold you could have chosen in advance; milling then runs for a long time. In
 "Absolute + stall latch" mode the criterion also completes when the foreground trace has provably
 floored — dropped well below its running peak and stayed flat for a sustained window. Completions
 that relied on the latch are labeled `(stall)` in the results panel and recorded as
-`completed_via_stall` in the run metadata, so it is worth checking the final image in those runs.
-Choosing "Absolute (threshold)" turns the latch off entirely.
+`completed_via_stall` in the run metadata. Choosing "Absolute (threshold)" turns the latch off entirely.
 
 ## Contrast and brightness calibration
 
@@ -57,11 +55,6 @@ of a run, aiming for a target median brightness and dynamic range while keeping 
 limits you set. The measured response of each detector is cached in `logs\cb_plant.json` and reused
 to speed up later runs; the file is created automatically, is keyed by system name so several
 microscopes can share one deployment, and can be deleted safely.
-
-Two settings are worth reviewing for your samples: the target median fraction, which sets how
-bright the calibrated image is, and the maximum white clip fraction. Thin bright features can
-saturate and become invisible to the analysis if the white-clip allowance is loose, so keep it
-tight unless you have a reason not to.
 
 ## Files the application writes
 
