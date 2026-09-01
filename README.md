@@ -1,8 +1,6 @@
 # ATC Monitor
 
-ATC Monitor watches a focused ion beam (FIB) mill a lamella and tells you when it is done.
-
-It reads the microscope's real-time monitor (RTM) image stream through the Thermo Scientific
+ATC Monitor reads the microscope's real-time monitor (RTM) image stream through the Thermo Scientific
 AutoScript SDK, tracks how each pattern's milled area is changing, and stops patterning
 automatically once every pattern has met its completion criteria for a set number of consecutive
 confirmation rounds. It is designed to run unattended alongside AutoTEM Cryo.
