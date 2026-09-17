@@ -1,10 +1,15 @@
 # ATC Monitor
 
-<!-- Full documentation: https://<site>/scripts/atc_monitor/ (enable this link when the site is live) -->
+> [!NOTE]
+> **Full documentation:** https://chrisleethompson.github.io/scripts/atc_monitor/
 
 A PySide6 desktop utility that reads a Thermo Scientific FIB-SEM's real-time monitor (RTM) image stream through the Thermo Scientific AutoScript SDK, tracks how each milling pattern's area is changing, and stops patterning automatically once every pattern has met its completion criteria. It runs unattended alongside Thermo Scientific AutoTEM Cryo (ATC) during the Rough Milling activity, and can also monitor Rectangle patterns used for manual milling.
 
 This script is experimental. Many of the features are still being explored and tested.
+
+## Documentation
+
+Full documentation: https://chrisleethompson.github.io/scripts/atc_monitor/
 
 ## Features
 
