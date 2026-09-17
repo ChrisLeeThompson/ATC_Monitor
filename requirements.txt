@@ -1,7 +1,8 @@
 # ATC Monitor - Python dependencies
-# Python 3.11. Thermo Scientific AutoScript 4.13+ is also required
+# Python 3.11. Thermo Scientific AutoScript 4.14+ is also required
 # (proprietary TFS package, not on pip; its Enthought environment already
-# bundles every package below).
+# bundles every package below). Version floors are the versions in the
+# AutoScript 4.14 Python environment, where the app is developed and tested.
 
 # GUI framework - pinned to the validated version. Qt object-lifetime behavior
 # is version-sensitive: the worker teardown path destroys QObjects explicitly
@@ -13,10 +14,10 @@ PySide6==6.7.1
 shiboken6==6.7.1
 
 # Imaging / analysis
-numpy
-opencv-python
-Pillow
-scikit-image
+numpy>=2.2.5
+opencv-python>=4.8.1
+Pillow>=10.1.0
+scikit-image>=0.25.2
 
 # Plotting
-matplotlib
+matplotlib>=3.8.1
